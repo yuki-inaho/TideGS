@@ -1,6 +1,6 @@
 # TideGS
 
-[![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b.svg)](#)
+[![arXiv](https://img.shields.io/badge/arXiv-2605.20150-b31b1b.svg)](https://arxiv.org/abs/2605.20150)
 [![Project Page](https://img.shields.io/badge/Project-Page-blue.svg)](https://sponge-lab.github.io/TideGS)
 [![License](https://img.shields.io/badge/License-Apache--2.0-green.svg)](LICENSE)
 
