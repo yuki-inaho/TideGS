@@ -6,6 +6,7 @@ their metadata, and scheduling information.
 """
 
 import numpy as np
+import threading
 import torch
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
@@ -277,6 +278,7 @@ class FrustumCuller:
         self.scene_radius = scene_radius
         self.block_size = block_size
         self.verbose = bool(verbose)
+        self._bounds_lock = threading.RLock()
         
         # 预计算中心点 (N, 3)，避免每帧重复计算
         # 利用 Numpy 广播机制
@@ -329,14 +331,81 @@ class FrustumCuller:
         centers = (mins + maxs) / 2.0
         radii = (np.linalg.norm(maxs - mins, axis=1) / 2.0) * 1.15
 
-        self.block_bounds[ids] = bounds
-        self.block_centers[ids] = centers
-        self.block_radii[ids] = radii
-        if radii.size:
-            self.block_radius = max(float(self.block_radius), float(np.max(radii)))
+        with self._bounds_lock:
+            self.block_bounds[ids] = bounds
+            self.block_centers[ids] = centers
+            self.block_radii[ids] = radii
+            if radii.size:
+                self.block_radius = max(float(self.block_radius), float(np.max(radii)))
         return int(ids.size)
 
     def cull(
+        self,
+        camera_position: np.ndarray,
+        view_matrix: np.ndarray,
+        projection_matrix: np.ndarray,
+        margin: float = 1.0,
+        use_6plane: bool = True,
+    ) -> List[int]:
+        with self._bounds_lock:
+            return self._cull_locked(
+                camera_position,
+                view_matrix,
+                projection_matrix,
+                margin,
+                use_6plane,
+            )
+
+    def cull_subset(
+        self,
+        camera_position: np.ndarray,
+        view_matrix: np.ndarray,
+        projection_matrix: np.ndarray,
+        block_ids,
+        margin: float = 1.0,
+        use_6plane: bool = True,
+    ) -> List[int]:
+        """Cull only ``block_ids`` using the same test as full-scene culling."""
+        if isinstance(block_ids, set):
+            block_ids = sorted(block_ids)
+        ids = np.asarray(block_ids, dtype=np.int64)
+        if ids.size == 0:
+            return []
+        if np.any(ids < 0) or np.any(ids >= self.num_blocks):
+            raise ValueError("block_ids contains an out-of-range block")
+
+        with self._bounds_lock:
+            if not use_6plane:
+                visible = set(
+                    self._cull_locked(
+                        camera_position,
+                        view_matrix,
+                        projection_matrix,
+                        margin,
+                        use_6plane,
+                    )
+                )
+                return [int(block_id) for block_id in ids if int(block_id) in visible]
+
+            planes = extract_frustum_planes(view_matrix, projection_matrix)
+            centers_homo = np.concatenate(
+                [
+                    self.block_centers[ids],
+                    np.ones((ids.size, 1), dtype=np.float32),
+                ],
+                axis=1,
+            )
+            signed_distances = np.sum(
+                planes[np.newaxis, :, :] * centers_homo[:, np.newaxis, :],
+                axis=2,
+            )
+            visible_mask = np.all(
+                signed_distances >= -self.block_radii[ids, np.newaxis],
+                axis=1,
+            )
+            return ids[visible_mask].astype(np.int64, copy=False).tolist()
+
+    def _cull_locked(
         self,
         camera_position: np.ndarray,
         view_matrix: np.ndarray,
@@ -448,7 +517,8 @@ class FrustumCuller:
             
         # 向量化排序
         # 1. 提取可见块的中心点
-        centers = self.block_centers[visible_blocks]
+        with self._bounds_lock:
+            centers = self.block_centers[visible_blocks].copy()
         
         # 2. 计算距离平方 (比开根号快，排序结果一样)
         diff = centers - camera_position

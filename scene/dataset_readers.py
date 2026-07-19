@@ -28,7 +28,7 @@ import utils.general_utils as utils
 from tqdm import tqdm
 import numpy as np
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from utils.graphics_utils import BasicPointCloud
@@ -47,6 +47,7 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     cam_center: np.array = None
+    image_cache_key: str = None
 
 
 class PureSSDPlyInitError(RuntimeError):
@@ -99,9 +100,17 @@ def _get_city_frame_ref(frame):
     raise KeyError("City frame must contain either 'file_name' or 'file_path'")
 
 
+def _city_frame_cache_key(frame_ref, mode):
+    relative_path = PurePosixPath(str(frame_ref).replace("\\", "/"))
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError(f"City frame path must be relative: {frame_ref!r}")
+    return (PurePosixPath(mode) / relative_path).as_posix()
+
+
 def _resolve_city_frame_image(path, transformsfile, frame, mode):
     frame_ref = _get_city_frame_ref(frame)
     frame_ref_str = str(frame_ref)
+    cache_key = _city_frame_cache_key(frame_ref, mode)
     transforms_abs = os.path.realpath(os.path.join(path, transformsfile))
     transforms_dir = os.path.dirname(transforms_abs)
 
@@ -129,9 +138,9 @@ def _resolve_city_frame_image(path, transformsfile, frame, mode):
 
     for candidate in normalized_candidates:
         if os.path.exists(candidate):
-            return candidate, os.path.basename(frame_ref_str)
+            return candidate, os.path.basename(frame_ref_str), cache_key
 
-    return normalized_candidates[0], os.path.basename(frame_ref_str)
+    return normalized_candidates[0], os.path.basename(frame_ref_str), cache_key
 
 
 def getNerfppNorm(cam_info):
@@ -468,7 +477,9 @@ def readCamerasFromTransformsCity(
     )
 
     for idx, frame in enumerate(frames):
-        cam_path, cam_name = _resolve_city_frame_image(path, transformsfile, frame, mode)
+        cam_path, cam_name, image_cache_key = _resolve_city_frame_image(
+            path, transformsfile, frame, mode
+        )
         if not os.path.exists(cam_path):
             print(f"File {cam_path} not found, skipping...")
             continue
@@ -554,7 +565,7 @@ def readCamerasFromTransformsCity(
         # # ====== debug ======
 
         image_path = cam_path
-        image_name = cam_name[-17:]  # Path(cam_name).stem
+        image_name = cam_name
         image = Image.open(image_path)
 
         if fovx is not None:
@@ -579,6 +590,7 @@ def readCamerasFromTransformsCity(
                 width=image.size[0],
                 height=image.size[1],
                 cam_center=Ts[idx],
+                image_cache_key=image_cache_key,
             )
         )
 

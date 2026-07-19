@@ -521,6 +521,83 @@ class TieredCacheManager:
         self._maybe_evict()
         return staged
 
+    def upsert_dirty_block_batch(self, block_tensors: Dict[int, torch.Tensor]) -> int:
+        """Own one contiguous copy of a staged writeback batch.
+
+        The incoming tensors are ordered views into one reusable pinned slab.
+        Cache entries become views into a single cache-owned slab, avoiding one
+        allocation and clone per block while preserving ownership after the
+        producer reuses its staging slot.
+        """
+        if not block_tensors:
+            return 0
+
+        items = []
+        for block_id, tensor in block_tensors.items():
+            if not self._is_valid_block_tensor(
+                block_id, tensor, 'upsert_dirty_block_batch'
+            ):
+                continue
+            items.append((int(block_id), tensor))
+        if not items:
+            return 0
+
+        total_rows = sum(int(tensor.shape[0]) for _, tensor in items)
+        first = items[0][1]
+        try:
+            owned = torch.empty(
+                (total_rows, self.point_dim),
+                dtype=first.dtype,
+                pin_memory=bool(first.is_pinned()),
+            )
+        except RuntimeError:
+            owned = torch.empty(
+                (total_rows, self.point_dim), dtype=first.dtype
+            )
+
+        same_storage = all(
+            tensor.untyped_storage().data_ptr()
+            == first.untyped_storage().data_ptr()
+            for _, tensor in items
+        )
+        contiguous_offsets = same_storage
+        expected_offset = int(first.storage_offset())
+        for _, tensor in items:
+            contiguous_offsets = contiguous_offsets and (
+                tensor.is_contiguous()
+                and int(tensor.storage_offset()) == expected_offset
+            )
+            expected_offset += int(tensor.numel())
+
+        if contiguous_offsets:
+            source = first.as_strided(
+                (total_rows, self.point_dim),
+                (self.point_dim, 1),
+                storage_offset=int(first.storage_offset()),
+            )
+            owned.copy_(source)
+        else:
+            offset = 0
+            for _, tensor in items:
+                row_count = int(tensor.shape[0])
+                owned[offset:offset + row_count].copy_(tensor)
+                offset += row_count
+
+        staged = 0
+        offset = 0
+        with self.cache_lock:
+            for block_id, tensor in items:
+                row_count = int(tensor.shape[0])
+                self.cache_data[block_id] = owned[offset:offset + row_count]
+                self.cache_data.move_to_end(block_id)
+                self.block_versions[block_id] = self.block_versions.get(block_id, 0) + 1
+                self.dirty_set.add(block_id)
+                offset += row_count
+                staged += 1
+
+        self._maybe_evict()
+        return staged
+
     def submit_dirty_blocks(self, block_ids: List[int], clone: bool = True, reason: str = 'paper_writeback') -> int:
         """Submit dirty RAM blocks for asynchronous SSD writeback."""
         if not block_ids:

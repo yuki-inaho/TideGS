@@ -131,6 +131,8 @@ class AuxiliaryParams(ParamGroup):
         )
         self.pure_ssd_checkpoint_chunk_blocks = 256  # Blocks per chunk when writing pure SSD snapshot checkpoints
         self.pure_ssd_checkpoint_mode = "incremental"  # incremental by default; snapshot is debug/fallback
+        self.pure_ssd_checkpoint_patch_mode = "hardlink"  # hardlink avoids duplicate patch bytes; copy is portable across filesystems
+        self.pure_ssd_checkpoint_keep_last = 2  # Retain the newest resumable checkpoints
         self.pure_ssd_prebuilt_manifest = ""  # Reuse an existing streaming_init_manifest.json and skip PLY streaming init
         self.pure_ssd_prebuilt_base_file = ""  # Optional override for the manifest base_file path
         self.pure_ssd_prebuilt_block_bounds = ""  # Optional override for the manifest block_bounds path
@@ -189,6 +191,10 @@ class AuxiliaryParams(ParamGroup):
         self.max_ram_gb = 32.0
         self.num_clusters = 64
         self.visualize_ssd_schedule = False  # Generate TSP schedule visualization
+        self.ssd_schedule_ordering = "trajectory"  # {trajectory, shuffle}
+        self.tide_storage_max_patch_files = 16  # Compact append-only deltas at this file count
+        self.tide_storage_max_patch_gb = 64.0  # Compact after this much stale delta data accumulates
+        self.tide_storage_min_free_gb = 64.0  # Refuse writes that consume this reserve
         self.pure_ssd_schedule_cache_dir = ""  # Optional persistent cache for pure SSD camera TSP schedules
         self.pure_ssd_disable_schedule_cache = False  # Disable pure SSD camera schedule cache
         self.enable_hotspot_retention = True  # Enable GPU hotspot retention to reduce RAM→GPU bandwidth
@@ -616,6 +622,25 @@ def init_args(args):
         assert args.pure_ssd_checkpoint_mode in {"incremental", "snapshot"}, (
             "pure_ssd_checkpoint_mode must be incremental or snapshot"
         )
+    if hasattr(args, "pure_ssd_checkpoint_patch_mode"):
+        args.pure_ssd_checkpoint_patch_mode = str(args.pure_ssd_checkpoint_patch_mode).lower()
+        assert args.pure_ssd_checkpoint_patch_mode in {"hardlink", "copy"}, (
+            "pure_ssd_checkpoint_patch_mode must be hardlink or copy"
+        )
+    if hasattr(args, "pure_ssd_checkpoint_keep_last"):
+        args.pure_ssd_checkpoint_keep_last = int(args.pure_ssd_checkpoint_keep_last)
+        assert args.pure_ssd_checkpoint_keep_last == -1 or args.pure_ssd_checkpoint_keep_last > 0, (
+            "pure_ssd_checkpoint_keep_last must be -1 or a positive integer"
+        )
+    if hasattr(args, "tide_storage_max_patch_files"):
+        args.tide_storage_max_patch_files = int(args.tide_storage_max_patch_files)
+        assert args.tide_storage_max_patch_files >= 2
+    if hasattr(args, "tide_storage_max_patch_gb"):
+        args.tide_storage_max_patch_gb = float(args.tide_storage_max_patch_gb)
+        assert args.tide_storage_max_patch_gb >= 0
+    if hasattr(args, "tide_storage_min_free_gb"):
+        args.tide_storage_min_free_gb = float(args.tide_storage_min_free_gb)
+        assert args.tide_storage_min_free_gb >= 0
 
     if hasattr(args, "pure_ssd_sort_memory_mb"):
         args.pure_ssd_sort_memory_mb = float(args.pure_ssd_sort_memory_mb)

@@ -39,6 +39,7 @@ _test.py
 **/*.egg-info/
 
 # Local experiment and profiling artifacts
+/memo.sh
 trace_dump/
 wandb/
 *.nsys-rep

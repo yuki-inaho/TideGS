@@ -1,9 +1,19 @@
 # TideGS
 
-[![arXiv](https://img.shields.io/badge/arXiv-2605.20150-b31b1b.svg)](https://arxiv.org/abs/2605.20150)
-[![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Paper-yellow.svg)](https://huggingface.co/papers/2605.20150)
-[![Project Page](https://img.shields.io/badge/Project-Page-blue.svg)](https://sponge-lab.github.io/TideGS)
-[![License](https://img.shields.io/badge/License-Apache--2.0-green.svg)](LICENSE)
+<p>
+  <a href="https://sponge-lab.github.io/TideGS">
+    <img src="https://img.shields.io/badge/Project-Page-0891B2?style=flat-square&logo=googlechrome&logoColor=white" alt="Project Page">
+  </a>
+  <a href="https://arxiv.org/abs/2605.20150">
+    <img src="https://img.shields.io/badge/arXiv-2605.20150-B31B1B?style=flat-square&logo=arxiv&logoColor=white" alt="arXiv">
+  </a>
+  <a href="https://huggingface.co/papers/2605.20150">
+    <img src="https://img.shields.io/badge/Hugging_Face-Paper-FFD21E?style=flat-square&logo=huggingface&logoColor=black" alt="Hugging Face Paper">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-Apache--2.0-5C9E31?style=flat-square" alt="Apache-2.0 License">
+  </a>
+</p>
 
 TideGS is a system for training large-scale 3D Gaussian Splatting scenes with
 SSD-based out-of-core optimization. It keeps the full Gaussian parameter array
@@ -18,6 +28,9 @@ resident blocks in GPU memory.
 
 - Train city-scale 3DGS scenes without keeping the full Gaussian set in GPU memory.
 - Stream Gaussian blocks between SSD, CPU memory, and GPU resident buffers.
+- Overlap next-batch preparation with GPU training while retaining shared blocks
+  in persistent GPU slots.
+- Write back only dirty blocks that leave the resident set.
 - Reuse prebuilt SSD bases for repeated experiments without reprocessing the PLY.
 - Resume training from incremental checkpoints without copying the full base file.
 
@@ -41,6 +54,9 @@ PyTorch stack for your CUDA/platform first, then install the remaining Python
 dependencies and project extensions:
 
 ```bash
+git clone --recursive https://github.com/sponge-lab/TideGS.git
+cd TideGS
+
 pip install -r requirements.txt
 pip install --no-build-isolation submodules/clm_kernels
 pip install submodules/fast-tsp
@@ -138,7 +154,7 @@ Patch logs and checkpoints are written to the current run's SSD cache directory.
 
 ## Training
 
-Run the accepted full-camera MatrixCity 1B configuration:
+Run the recommended full-camera MatrixCity 1B configuration:
 
 ```bash
 GPU=0 \
@@ -148,6 +164,7 @@ bash scripts/train_matrixcity_1b.sh \
   --iterations 240 \
   --bsz 16 \
   --capacity 2048 \
+  --schedule-ordering trajectory \
   --resident-policy topc_balanced \
   --resident-lambda 0.3 \
   --resident-decay 0.95 \
@@ -170,11 +187,12 @@ training stdout is written to `python.log`. Use `--debug-logging` to add detaile
 runtime markers to `python.log`. Use `--verbose-terminal` only when actively
 debugging and you want the training subprocess to stream to the terminal.
 
-The accepted 1B configuration is:
+Recommended MatrixCity 1B settings:
 
 ```text
 batch size: 16
 resident block capacity: 2048
+schedule ordering: trajectory
 resident policy: balanced TopC
 resident lambda: 0.3
 recency decay: 0.95
@@ -228,7 +246,19 @@ bash scripts/train_matrixcity_1b.sh \
 
 Incremental checkpoints save the training state, the log-structured storage
 index, and the patch files needed by the latest block versions. They do not copy
-the immutable 1B `base_file.bin`.
+the immutable 1B `base_file.bin`. On the same filesystem, checkpoint patches
+use hard links by default, so creating a checkpoint does not duplicate their
+physical bytes. Use `--checkpoint-patch-mode copy` only when independent copies
+are required across filesystems.
+
+Patch storage is compacted automatically at 16 files or 64 GiB of reclaimable
+stale block versions. Compaction
+rewrites only the latest updated blocks, never the immutable base, and only
+garbage-collects patch paths owned by the current run. The newest two
+checkpoints are retained by default. These limits can be adjusted with
+`--max-patch-files`, `--max-patch-gb`, `--min-free-gb`, and
+`--checkpoint-keep-last`; writes stop before consuming the configured free-space
+reserve.
 
 ## Outputs
 

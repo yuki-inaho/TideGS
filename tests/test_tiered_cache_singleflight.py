@@ -114,6 +114,26 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
         thread.start()
         return thread, result, errors
 
+    def test_dirty_batch_uses_one_cache_owned_slab(self):
+        storage = FakeStorage(block_size=2, point_dim=3)
+        cache = self.make_cache(storage)
+        source = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        expected = source.clone()
+
+        self.assertEqual(
+            cache.upsert_dirty_block_batch({5: source[:2], 6: source[2:]}),
+            2,
+        )
+        source.add_(100.0)
+
+        self.assertTrue(torch.equal(cache.cache_data[5], expected[:2]))
+        self.assertTrue(torch.equal(cache.cache_data[6], expected[2:]))
+        self.assertEqual(
+            cache.cache_data[5].untyped_storage().data_ptr(),
+            cache.cache_data[6].untyped_storage().data_ptr(),
+        )
+        self.assertEqual(cache.dirty_set, {5, 6})
+
     def test_future_read_serves_urgent_without_second_ssd_read(self):
         storage = FakeStorage()
         storage.block_first_read = True

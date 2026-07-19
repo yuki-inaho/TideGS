@@ -15,6 +15,7 @@ from torch.cuda import nvtx
 from tqdm import tqdm
 
 from utils.mem_monitor import MemMonitor
+from utils.camera_batch_prefetcher import CameraBatchPrefetcher
 from argparse import ArgumentParser
 from arguments import (
     AuxiliaryParams,
@@ -43,6 +44,7 @@ from storage.schedule_utils import get_camera_batch_schedule
 from storage.pure_ssd_checkpoint import (
     is_pure_ssd_checkpoint,
     load_pure_ssd_checkpoint_manifest,
+    prune_checkpoint_history,
     write_pure_ssd_incremental_checkpoint,
     write_pure_ssd_snapshot_checkpoint,
 )
@@ -144,8 +146,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # ============================================================================
 
     assert args.dataset_cache_and_stream_mode in [
-        "load_from_disk_on_demand"
-    ], f"Only load_from_disk_on_demand is supported for now, but got {args.dataset_cache_and_stream_mode}"
+        "load_from_source_on_demand",
+        "load_from_disk_on_demand",
+    ], f"Unsupported dataset_cache_and_stream_mode: {args.dataset_cache_and_stream_mode}"
     try:
         validate_tide_runtime_args(args)
     except RuntimeError as exc:
@@ -225,6 +228,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             num_clusters=args.num_clusters,
             use_6plane=args.use_6plane,
             execution_mode=args.ssd_execution_mode,
+            max_patch_files=args.tide_storage_max_patch_files,
+            max_patch_gb=args.tide_storage_max_patch_gb,
+            min_free_gb=args.tide_storage_min_free_gb,
         )
 
         log_file.write(f"[SSD] Execution mode: {args.ssd_execution_mode}\n")
@@ -261,6 +267,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             cache_manager=storage_adapter.cache,
             total_gaussians=int(total_gaussians),
             block_size=int(args.gaussian_block_size),
+            before_read=storage_adapter.wait_for_cache_blocks,
+            filter_hint=storage_adapter.filter_cache_prefetch_candidates,
         )
 
         utils.print_rank_0(
@@ -398,6 +406,14 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     gaussians._paper_optimizer_block_size = int(getattr(args, 'gaussian_block_size', 4096))
     gaussians._paper_optimizer_backend = 'gpu_resident'
     _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
+    camera_batch_prefetcher = CameraBatchPrefetcher(train_dataset)
+    initial_camera_schedule = get_camera_batch_schedule(
+        training_schedule=ssd_training_schedule,
+        iteration=start_from_this_iteration,
+        batch_size=args.bsz,
+        schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
+    )
+    camera_batch_prefetcher.submit(initial_camera_schedule.batch_indices)
     # ============================================================================
     # STAGE 2: MAIN TRAINING LOOP
     # ============================================================================
@@ -470,6 +486,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         ):
             _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
 
+        nvtx.range_push("Outer: next_camera_load")
         schedule_info = get_camera_batch_schedule(
             training_schedule=ssd_training_schedule,
             iteration=iteration,
@@ -492,7 +509,20 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 )
                 optimizer_churn_state['current_epoch'] = epoch
 
-        batched_cameras = [train_dataset[idx] for idx in batch_indices]
+        batched_cameras = camera_batch_prefetcher.get(batch_indices)
+        nvtx.range_pop()
+
+        next_iteration = iteration + args.bsz
+        if next_iteration <= opt_args.iterations:
+            nvtx.range_push("Outer: next_camera_prefetch_submit")
+            next_camera_schedule = get_camera_batch_schedule(
+                training_schedule=ssd_training_schedule,
+                iteration=next_iteration,
+                batch_size=args.bsz,
+                schedule_ordering=getattr(args, "ssd_schedule_ordering", "trajectory"),
+            )
+            camera_batch_prefetcher.submit(next_camera_schedule.batch_indices)
+            nvtx.range_pop()
 
         if iteration % 100 == 0:
             log_file.write(
@@ -511,6 +541,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         # ------------------------------------------------------------------------
         # 2.3: Transfer camera matrices to GPU
         # ------------------------------------------------------------------------
+        nvtx.range_push("Outer: camera_h2d")
         timers.start("send cam matrices to gpu")
         # Transfer world-view and projection transforms
         for camera in batched_cameras:
@@ -548,6 +579,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             for camera in batched_cameras:
                 camera.original_image = camera.original_image_backup.cuda()
             timers.stop("load_cameras")
+        nvtx.range_pop()
         assert args.bsz > 1, "Pipelined offload requires batch size > 1"
         losses, ordered_cams, sparsity = train_tide_batch(
             gaussians=gaussians,
@@ -573,10 +605,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
         batched_cameras = [batched_cameras[i] for i in ordered_cams]
 
+        nvtx.range_push("Outer: loss_sync")
         timers.start("sync_loss_and_log")
         batched_losses = torch.stack(losses)
         batched_loss_cpu = batched_losses.cpu().numpy()
+        nvtx.range_pop()
 
+        nvtx.range_push("Outer: batch_logging")
         ema_loss_for_log = (
             batched_loss_cpu.mean()
             if ema_loss_for_log is None
@@ -595,6 +630,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 [viewpoint_cam.image_name for viewpoint_cam in batched_cameras],
             )
         )
+        nvtx.range_pop()
 
         with torch.no_grad():
             if any(
@@ -645,6 +681,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 log_file.write(
                     f"[ITER {iteration}] Saving Pure SSD Checkpoint {checkpoint_iteration}\n"
                 )
+                storage_adapter.drain_cache_writebacks()
                 pure_ssd_checkpoint_mode = str(
                     getattr(args, "pure_ssd_checkpoint_mode", "incremental")
                 ).lower()
@@ -669,16 +706,24 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                         args=args,
                         log_file=log_file,
                     )
+                prune_checkpoint_history(
+                    scene.model_path,
+                    keep_last=getattr(args, "pure_ssd_checkpoint_keep_last", 2),
+                    log_file=log_file,
+                )
                 end2end_timers.start()
 
         # ------------------------------------------------------------------------
         # 2.12: Iteration cleanup
         # ------------------------------------------------------------------------
-        torch.cuda.synchronize()  # Ensure all GPU operations are complete
+        if storage_adapter is None:
+            torch.cuda.synchronize()
 
         # Release camera image memory
+        nvtx.range_push("Outer: camera_cleanup")
         for viewpoint_cam in batched_cameras:
             viewpoint_cam.original_image = None
+        nvtx.range_pop()
 
         # End profiling range if active
         if args.nsys_profile:
@@ -713,6 +758,15 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         optimizer_churn_tsv.close()
         optimizer_churn_tsv = None
 
+    camera_prefetch_stats = camera_batch_prefetcher.get_stats()
+    camera_batch_prefetcher.close()
+    log_file.write(
+        "[CAMERA PREFETCH] "
+        f"batches={camera_prefetch_stats['batches']} "
+        f"ready_hits={camera_prefetch_stats['ready_hits']} "
+        f"wait_seconds={camera_prefetch_stats['wait_seconds']:.6f}\n"
+    )
+
     # ============================================================================
     # STAGE 3: POST-TRAINING CLEANUP AND REPORTING
     # ============================================================================
@@ -736,7 +790,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     mem_mon.close()
 
     if storage_adapter is not None:
+        from strategies.tide_engine.engine import shutdown_double_buffer_gpu
+
         storage_adapter.shutdown()
+        shutdown_double_buffer_gpu()
 
     scene.clean_up()
 

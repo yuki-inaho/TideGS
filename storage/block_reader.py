@@ -25,8 +25,9 @@ block data without hard-coding a source-specific offset table.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Protocol, runtime_checkable
+from typing import Callable, Dict, List, Optional, Protocol, Sequence, runtime_checkable
 
 import torch
 
@@ -41,6 +42,49 @@ class BlockLayout(Enum):
 
     UNIFIED = "unified"  # xyz | opacity | scaling | rotation | dc | rest
     CACHE = "cache"      # xyz | scaling  | rotation | opacity  | dc | rest
+
+
+@dataclass(frozen=True)
+class BlockBatch:
+    tensor: torch.Tensor
+    block_ids: tuple[int, ...]
+    block_slices: Dict[int, slice]
+    layout: BlockLayout
+
+
+def _pack_block_batch(
+    blocks: Dict[int, torch.Tensor],
+    block_ids: Sequence[int],
+    layout: BlockLayout,
+    out: Optional[torch.Tensor] = None,
+) -> BlockBatch:
+    ordered_ids = tuple(int(block_id) for block_id in block_ids)
+    missing = [block_id for block_id in ordered_ids if block_id not in blocks]
+    if missing:
+        raise KeyError(f"BlockReader omitted blocks; first missing={missing[:8]}")
+
+    pieces = [blocks[block_id] for block_id in ordered_ids]
+    total_rows = sum(int(piece.shape[0]) for piece in pieces)
+    if out is None:
+        out = torch.empty((total_rows, 59), dtype=torch.float32)
+    elif out.device.type != "cpu" or out.dim() != 2 or tuple(out.shape) != (total_rows, 59):
+        raise ValueError(
+            f"BlockBatch output must be CPU ({total_rows}, 59); got {tuple(out.shape)} "
+            f"on {out.device}"
+        )
+
+    if len(pieces) == 1:
+        out.copy_(pieces[0])
+    elif pieces:
+        torch.cat(pieces, dim=0, out=out)
+
+    block_slices = {}
+    offset = 0
+    for block_id, piece in zip(ordered_ids, pieces):
+        next_offset = offset + int(piece.shape[0])
+        block_slices[block_id] = slice(offset, next_offset)
+        offset = next_offset
+    return BlockBatch(out, ordered_ids, block_slices, layout)
 
 
 @runtime_checkable
@@ -59,6 +103,13 @@ class BlockReader(Protocol):
     layout: BlockLayout
 
     def read_blocks(self, block_ids: List[int]) -> Dict[int, torch.Tensor]:
+        ...
+
+    def read_batch(
+        self,
+        block_ids: List[int],
+        out: Optional[torch.Tensor] = None,
+    ) -> BlockBatch:
         ...
 
     def hint_future(self, block_ids: List[int]) -> int:
@@ -109,6 +160,13 @@ class UnifiedParamsBlockReader:
             out[bid] = data[start:end]
         return out
 
+    def read_batch(
+        self,
+        block_ids: List[int],
+        out: Optional[torch.Tensor] = None,
+    ) -> BlockBatch:
+        return _pack_block_batch(self.read_blocks(block_ids), block_ids, self.layout, out)
+
     def hint_future(self, block_ids: List[int]) -> int:
         # In-memory slicing has no prefetch semantics.
         return 0
@@ -129,22 +187,43 @@ class TieredCacheBlockReader:
 
     layout = BlockLayout.CACHE
 
-    def __init__(self, cache_manager, total_gaussians: int, block_size: int):
+    def __init__(
+        self,
+        cache_manager,
+        total_gaussians: int,
+        block_size: int,
+        before_read: Optional[Callable[[List[int]], None]] = None,
+        filter_hint: Optional[Callable[[List[int]], List[int]]] = None,
+    ):
         if cache_manager is None:
             raise ValueError("TieredCacheBlockReader requires a non-None cache_manager")
         self._cache = cache_manager
         self.total_gaussians = int(total_gaussians)
         self.block_size = int(block_size)
         self.num_blocks = (self.total_gaussians + self.block_size - 1) // self.block_size
+        self._before_read = before_read
+        self._filter_hint = filter_hint
 
     def read_blocks(self, block_ids: List[int]) -> Dict[int, torch.Tensor]:
         valid_ids = [int(b) for b in block_ids if 0 <= int(b) < self.num_blocks]
         if not valid_ids:
             return {}
+        if self._before_read is not None:
+            self._before_read(valid_ids)
         return self._cache.prefetch(valid_ids)
+
+    def read_batch(
+        self,
+        block_ids: List[int],
+        out: Optional[torch.Tensor] = None,
+    ) -> BlockBatch:
+        valid_ids = [int(b) for b in block_ids if 0 <= int(b) < self.num_blocks]
+        return _pack_block_batch(self.read_blocks(valid_ids), valid_ids, self.layout, out)
 
     def hint_future(self, block_ids: List[int]) -> int:
         valid_ids = [int(b) for b in block_ids if 0 <= int(b) < self.num_blocks]
+        if self._filter_hint is not None:
+            valid_ids = self._filter_hint(valid_ids)
         if not valid_ids:
             return 0
         prefetcher = getattr(self._cache, 'prefetch_future', None)
@@ -213,6 +292,7 @@ def resolve_block_reader_backend(
 
 __all__ = [
     'BlockLayout',
+    'BlockBatch',
     'BlockReader',
     'UnifiedParamsBlockReader',
     'TieredCacheBlockReader',

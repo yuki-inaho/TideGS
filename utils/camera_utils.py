@@ -26,7 +26,14 @@ import torch
 from PIL import Image
 
 
-def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
+def loadCam(
+    args,
+    id,
+    cam_info,
+    decompressed_image=None,
+    return_image=False,
+    offload=False,
+):
     # orig_w, orig_h = cam_info.width, cam_info.height
     # assert (
     #     orig_w == utils.get_img_width() and orig_h == utils.get_img_height()
@@ -69,6 +76,20 @@ def loadCam(args, id, cam_info, decompressed_image=None, return_image=False):
         gt_alpha_mask=loaded_mask,
         image_name=cam_info.image_name,
         uid=id,
+        offload=offload,
+    )
+
+
+def _raw_image_relative_path(cam_info):
+    cache_key = getattr(cam_info, "image_cache_key", None) or cam_info.image_name
+    return cache_key.lstrip("/") + ".raw"
+
+
+def _raw_image_path(decode_dataset_path, cam_info):
+    return os.path.join(
+        decode_dataset_path,
+        "dataset_raw",
+        _raw_image_relative_path(cam_info),
     )
 
 
@@ -80,18 +101,17 @@ def loadCam_raw_from_disk(args, id, cam_info, to_gpu=False):
     orig_h, orig_w = utils.get_img_size()
 
     # Get dececoded gt_image from disk
+    raw_path = _raw_image_path(args.decode_dataset_path, cam_info)
     try:
-        with open(
-            os.path.join(
-                args.decode_dataset_path,
-                "dataset_raw",
-                (cam_info.image_name.lstrip("/") + ".raw"),
-            ),
-            "rb",
-        ) as raw_file:
+        with open(raw_path, "rb") as raw_file:
             raw_data = raw_file.read()
-    except RuntimeError as e:
-        raise RuntimeError(e)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Decoded image is missing: {raw_path}. MatrixCity raw caches must "
+            "preserve split and block directories; basename-only caches from "
+            "older releases are incompatible. Use load_from_source_on_demand "
+            "or rebuild the raw cache in a new directory."
+        ) from exc
 
     raw_np = np.frombuffer(raw_data, dtype=np.uint8)
     if to_gpu:
@@ -258,11 +278,7 @@ def _process_single_image_for_predecode(params):
             (0, 0, orig_w, orig_h)
         )  # crop the image to the minimum size in dataset
         raw_data = img.tobytes()
-        raw_data_path = os.path.join(
-            decode_dataset_path,
-            "dataset_raw",
-            (cam_info.image_name.lstrip("/") + ".raw"),
-        )
+        raw_data_path = _raw_image_path(decode_dataset_path, cam_info)
         os.makedirs(os.path.dirname(raw_data_path), exist_ok=True)
         with open(raw_data_path, "wb+") as raw_file:
             raw_file.write(raw_data)
@@ -320,9 +336,7 @@ def predecode_dataset_to_disk(cam_infos, args):
             (0, 0, orig_w, orig_h)
         )  # crop the image to the minimum size in dataset
         raw_data = img.tobytes()
-        raw_data_path = os.path.join(
-            args.decode_dataset_path, "dataset_raw", (c.image_name.lstrip("/") + ".raw")
-        )
+        raw_data_path = _raw_image_path(args.decode_dataset_path, c)
         os.makedirs(os.path.dirname(raw_data_path), exist_ok=True)
         with open(raw_data_path, "wb+") as raw_file:
             raw_file.write(raw_data)

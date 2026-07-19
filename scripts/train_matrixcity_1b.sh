@@ -33,8 +33,14 @@ DEBUG_CAMERA_SAMPLE_MODE="linspace"
 DEBUG_CAMERA_SAMPLE_START=0
 MAX_RAM_GB=32
 NUM_CLUSTERS=64
+SCHEDULE_ORDERING="trajectory"
 PROJECTION_CHUNK=2
 CHECKPOINT_MODE="incremental"
+CHECKPOINT_PATCH_MODE="hardlink"
+CHECKPOINT_KEEP_LAST=2
+MAX_PATCH_FILES=16
+MAX_PATCH_GB=64
+MIN_FREE_GB=64
 RESIDENT_POLICY="topc_balanced"
 RESIDENT_LAMBDA_LIST="0.3"
 RESIDENT_DECAY_LIST="0.95"
@@ -64,6 +70,7 @@ Options:
   --ply PATH                  1B PLY path
   --manifest PATH             Prebuilt streaming_init_manifest.json
   --schedule-cache DIR        Camera schedule cache dir
+  --schedule-ordering MODE    trajectory|shuffle (default: ${SCHEDULE_ORDERING})
   --decode-dataset-path DIR   Optional decoded raw image cache dir
   --iterations N              Iterations for sweep mode (default: ${ITERATIONS})
   --debug-max-train-cameras N Camera cap; -1 uses all training cameras (default: ${DEBUG_MAX_TRAIN_CAMERAS})
@@ -76,6 +83,11 @@ Options:
   --projection-chunk N        projection_max_cameras_per_chunk (default: ${PROJECTION_CHUNK})
   --max-ram-gb N              RAM cache budget (default: ${MAX_RAM_GB})
   --checkpoint-mode MODE      incremental|snapshot (default: ${CHECKPOINT_MODE})
+  --checkpoint-patch-mode M   hardlink|copy (default: ${CHECKPOINT_PATCH_MODE})
+  --checkpoint-keep-last N    Retain the newest N checkpoints; -1 keeps all (default: ${CHECKPOINT_KEEP_LAST})
+  --max-patch-files N         Compact at this active patch count (default: ${MAX_PATCH_FILES})
+  --max-patch-gb N            Compact at this stale patch size in GiB (default: ${MAX_PATCH_GB})
+  --min-free-gb N             Refuse writes that consume this free-space reserve (default: ${MIN_FREE_GB})
   --resident-policy POLICY    topc_strict|topc_balanced (default: ${RESIDENT_POLICY})
   --resident-lambda VALUE     Single resident-set mixing weight
   --resident-decay VALUE      Single resident recency decay value
@@ -117,6 +129,7 @@ while [[ $# -gt 0 ]]; do
     --ply) PLY="$2"; shift 2 ;;
     --manifest) MANIFEST="$2"; shift 2 ;;
     --schedule-cache) SCHED_CACHE="$2"; SCHED_CACHE_USER_SET=1; shift 2 ;;
+    --schedule-ordering) SCHEDULE_ORDERING="$2"; shift 2 ;;
     --decode-dataset-path) DECODE_DATASET_PATH="$2"; shift 2 ;;
     --iterations) ITERATIONS="$2"; shift 2 ;;
     --debug-max-train-cameras) DEBUG_MAX_TRAIN_CAMERAS="$2"; shift 2 ;;
@@ -129,6 +142,11 @@ while [[ $# -gt 0 ]]; do
     --projection-chunk) PROJECTION_CHUNK="$2"; shift 2 ;;
     --max-ram-gb) MAX_RAM_GB="$2"; shift 2 ;;
     --checkpoint-mode) CHECKPOINT_MODE="$2"; shift 2 ;;
+    --checkpoint-patch-mode) CHECKPOINT_PATCH_MODE="$2"; shift 2 ;;
+    --checkpoint-keep-last) CHECKPOINT_KEEP_LAST="$2"; shift 2 ;;
+    --max-patch-files) MAX_PATCH_FILES="$2"; shift 2 ;;
+    --max-patch-gb) MAX_PATCH_GB="$2"; shift 2 ;;
+    --min-free-gb) MIN_FREE_GB="$2"; shift 2 ;;
     --resident-policy) RESIDENT_POLICY="$2"; shift 2 ;;
     --resident-lambda) RESIDENT_LAMBDA_LIST="$2"; shift 2 ;;
     --resident-lambda-list) RESIDENT_LAMBDA_LIST="$2"; shift 2 ;;
@@ -166,6 +184,10 @@ case "${CHECKPOINT_MODE}" in
   incremental|snapshot) ;;
   *) echo "Invalid --checkpoint-mode '${CHECKPOINT_MODE}'" >&2; usage >&2; exit 1 ;;
 esac
+case "${CHECKPOINT_PATCH_MODE}" in
+  hardlink|copy) ;;
+  *) echo "Invalid --checkpoint-patch-mode '${CHECKPOINT_PATCH_MODE}'" >&2; exit 1 ;;
+esac
 case "${RESIDENT_POLICY}" in
   topc_strict|topc_balanced) ;;
   *) echo "Invalid --resident-policy '${RESIDENT_POLICY}'" >&2; usage >&2; exit 1 ;;
@@ -173,6 +195,10 @@ esac
 case "${DEBUG_CAMERA_SAMPLE_MODE}" in
   linspace|contiguous|window) ;;
   *) echo "Invalid --debug-camera-sample-mode '${DEBUG_CAMERA_SAMPLE_MODE}'" >&2; usage >&2; exit 1 ;;
+esac
+case "${SCHEDULE_ORDERING}" in
+  trajectory|shuffle) ;;
+  *) echo "Invalid --schedule-ordering '${SCHEDULE_ORDERING}'" >&2; usage >&2; exit 1 ;;
 esac
 
 RUN_ROOT="${OUT_ROOT}/${RUN_TAG}"
@@ -257,6 +283,7 @@ append_train_command() {
     printf '  --gaussian_block_size 4096 \\\n'
     printf '  --max_ram_gb %q \\\n' "${MAX_RAM_GB}"
     printf '  --num_clusters %q \\\n' "${NUM_CLUSTERS}"
+    printf '  --ssd_schedule_ordering %q \\\n' "${SCHEDULE_ORDERING}"
     printf '  --tide_optimizer_backend gpu_resident \\\n'
     printf '  --tide_block_reader_backend tiered_cache \\\n'
     printf '  --tide_optimizer_deferred_mode off \\\n'
@@ -268,6 +295,11 @@ append_train_command() {
     printf '  --tide_optimizer_state_mode resident_blocks \\\n'
     printf '  --projection_max_cameras_per_chunk %q \\\n' "${PROJECTION_CHUNK}"
     printf '  --pure_ssd_checkpoint_mode %q \\\n' "${CHECKPOINT_MODE}"
+    printf '  --pure_ssd_checkpoint_patch_mode %q \\\n' "${CHECKPOINT_PATCH_MODE}"
+    printf '  --pure_ssd_checkpoint_keep_last %q \\\n' "${CHECKPOINT_KEEP_LAST}"
+    printf '  --tide_storage_max_patch_files %q \\\n' "${MAX_PATCH_FILES}"
+    printf '  --tide_storage_max_patch_gb %q \\\n' "${MAX_PATCH_GB}"
+    printf '  --tide_storage_min_free_gb %q \\\n' "${MIN_FREE_GB}"
     if [[ "${DEBUG_LOGGING}" == "1" ]]; then
       printf '  --tide_debug_logging \\\n'
     fi

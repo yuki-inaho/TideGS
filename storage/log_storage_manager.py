@@ -12,6 +12,7 @@ import os
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -26,6 +27,10 @@ class BlockLocation:
     offset: int   # Byte offset in the file
     size: int     # Size in bytes
     version: int  # Version number for tracking updates
+
+
+class StorageCapacityError(RuntimeError):
+    """Raised before a patch write would consume the configured free-space reserve."""
 
 
 class LogStorageManager:
@@ -46,6 +51,9 @@ class LogStorageManager:
         point_dim: int = 59,  # 3(xyz) + 3(scale) + 4(rot) + 3(opacity) + 48(SH)
         dtype: torch.dtype = torch.float32,
         verbose: bool = True,
+        max_patch_files: int = 16,
+        max_patch_gb: float = 64.0,
+        min_free_gb: float = 64.0,
     ):
         """
         Initialize Log-Structured Storage Manager.
@@ -57,6 +65,9 @@ class LogStorageManager:
             point_dim: Dimension per Gaussian point (default 59)
             dtype: Data type for storage
             verbose: Print routine storage lifecycle messages
+            max_patch_files: Compact when the active patch count reaches this value
+            max_patch_gb: Compact when reclaimable stale patch data reaches this size
+            min_free_gb: Free-space reserve enforced before writes and compaction
         """
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -68,6 +79,9 @@ class LogStorageManager:
         self.verbose = bool(verbose)
         self.bytes_per_point = point_dim * torch.finfo(dtype).bits // 8
         self.bytes_per_block = block_size * self.bytes_per_point
+        self.max_patch_files = max(2, int(max_patch_files))
+        self.max_stale_patch_bytes = max(0, int(float(max_patch_gb) * (1024 ** 3)))
+        self.min_free_bytes = max(0, int(float(min_free_gb) * (1024 ** 3)))
 
         # Metadata index: block_id -> BlockLocation
         # 用于快速查找任意 Block 当前存储在文件的哪个位置
@@ -85,17 +99,72 @@ class LogStorageManager:
         self.next_patch_id = 1
         # 计数器锁：确保多线程并发场景 patch 时ID不会冲突
         self.patch_counter_lock = threading.Lock()
+        self._write_lock = threading.RLock()
+        self._operation_condition = threading.Condition()
+        self._maintenance_active = False
+        self._active_operations = 0
 
         # Statistics
         self.stats = {
             'reads': 0,
             'writes': 0,
             'patches_created': 0,
-            'compactions': 0
+            'compactions': 0,
+            'compaction_input_bytes': 0,
+            'compaction_output_bytes': 0,
+            'compaction_reclaimed_bytes': 0,
+            'compactions_deferred': 0,
         }
 
         # 执行初始化逻辑， 建立初始的文件索引映射
         self._initialize_index()
+        self._remove_abandoned_temp_files()
+
+    @contextmanager
+    def _storage_operation(self):
+        with self._operation_condition:
+            while self._maintenance_active:
+                self._operation_condition.wait()
+            self._active_operations += 1
+        try:
+            yield
+        finally:
+            with self._operation_condition:
+                self._active_operations -= 1
+                if self._active_operations == 0:
+                    self._operation_condition.notify_all()
+
+    @contextmanager
+    def _exclusive_maintenance(self):
+        with self._operation_condition:
+            while self._maintenance_active:
+                self._operation_condition.wait()
+            self._maintenance_active = True
+            while self._active_operations:
+                self._operation_condition.wait()
+        try:
+            yield
+        finally:
+            with self._operation_condition:
+                self._maintenance_active = False
+                self._operation_condition.notify_all()
+
+    def _remove_abandoned_temp_files(self) -> None:
+        for path in self.storage_dir.glob(".tide_compact_*.tmp"):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _check_free_space(self, additional_bytes: int, operation: str) -> None:
+        free_bytes = shutil.disk_usage(self.storage_dir).free
+        required = max(0, int(additional_bytes)) + self.min_free_bytes
+        if free_bytes < required:
+            raise StorageCapacityError(
+                f"Insufficient space for {operation}: free={free_bytes / (1024 ** 3):.2f} GiB, "
+                f"required={required / (1024 ** 3):.2f} GiB including "
+                f"reserve={self.min_free_bytes / (1024 ** 3):.2f} GiB"
+            )
 
     def _initialize_index(self):
         """Initialize metadata index pointing all blocks to base file."""
@@ -133,6 +202,10 @@ class LogStorageManager:
                 )
 
     def read_blocks(self, block_ids: List[int]) -> Dict[int, torch.Tensor]:
+        with self._storage_operation():
+            return self._read_blocks_uncoordinated(block_ids)
+
+    def _read_blocks_uncoordinated(self, block_ids: List[int]) -> Dict[int, torch.Tensor]:
         """
         Read multiple blocks from storage.
         从存储中批量读取多个 blocks
@@ -218,6 +291,24 @@ class LogStorageManager:
         return torch.from_numpy(np_array).reshape(curr_num_points, self.point_dim)
 
     def write_patch(self, block_dict: Dict[int, torch.Tensor]) -> int:
+        if not block_dict:
+            return -1
+        estimated_bytes = sum(
+            int(tensor.numel()) * int(tensor.element_size())
+            for tensor in block_dict.values()
+            if tensor is not None and torch.is_tensor(tensor)
+        )
+        with self._write_lock:
+            if self._compaction_needed():
+                self.maybe_compact(min_patches=2)
+            self._check_free_space(estimated_bytes, "patch write")
+            with self._storage_operation():
+                patch_id = self._write_patch_uncoordinated(block_dict)
+            if self._compaction_needed():
+                self.maybe_compact(min_patches=2)
+            return patch_id
+
+    def _write_patch_uncoordinated(self, block_dict: Dict[int, torch.Tensor]) -> int:
         """
         Write updated blocks to a new patch file (append-only).
 
@@ -259,41 +350,40 @@ class LogStorageManager:
         # Create patch file
         timestamp = int(time.time() * 1000000)
         patch_file = self.storage_dir / f"patch_{patch_id:06d}_{timestamp}.bin"
-        self.file_paths[patch_id] = patch_file
-
         # Write blocks sequentially
         current_offset = 0
         updated_locations = {}
 
-        with open(patch_file, 'wb') as f:
-            for block_id in sorted(valid_blocks.keys()):  # Sort for determinism
-                tensor = valid_blocks[block_id]
+        try:
+            with open(patch_file, 'wb') as f:
+                for block_id in sorted(valid_blocks.keys()):  # Sort for determinism
+                    tensor = valid_blocks[block_id]
 
-                # Convert to bytes
-                if tensor.is_cuda:
-                    tensor = tensor.cpu()
+                    if tensor.is_cuda:
+                        tensor = tensor.cpu()
 
-                data_bytes = tensor.numpy().astype(np.float32).tobytes()
+                    data_bytes = tensor.numpy().astype(np.float32, copy=False).tobytes()
+                    f.write(data_bytes)
 
-                # Write to file
-                f.write(data_bytes)
-
-                # Record new location
-                with self.index_lock:
-                    old_version = self.index[block_id].version if block_id in self.index else 0
+                    with self.index_lock:
+                        old_version = self.index[block_id].version if block_id in self.index else 0
                     updated_locations[block_id] = BlockLocation(
                         file_id=patch_id,
                         offset=current_offset,
                         size=len(data_bytes),
-                        version=old_version + 1
+                        version=old_version + 1,
                     )
-
-                # 指针后移
-                current_offset += len(data_bytes)
+                    current_offset += len(data_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            patch_file.unlink(missing_ok=True)
+            raise
 
         # Update index atomically
         # 只有文件全部写完落盘后，才会更新内存索引，确保不会读到写了一半的文件
         with self.index_lock:
+            self.file_paths[patch_id] = patch_file
             for block_id, location in updated_locations.items():
                 self.index[block_id] = location
 
@@ -308,14 +398,40 @@ class LogStorageManager:
         self,
         manifest_path: str | Path,
         patches_dir: str | Path,
-        copy_patch_files: bool = True,
+        copy_patch_files: Optional[bool] = None,
+        patch_file_mode: str = "hardlink",
+    ) -> Dict:
+        with self._write_lock:
+            with self._storage_operation():
+                return self._export_index_manifest_uncoordinated(
+                    manifest_path=manifest_path,
+                    patches_dir=patches_dir,
+                    copy_patch_files=copy_patch_files,
+                    patch_file_mode=patch_file_mode,
+                )
+
+    def _export_index_manifest_uncoordinated(
+        self,
+        manifest_path: str | Path,
+        patches_dir: str | Path,
+        copy_patch_files: Optional[bool] = None,
+        patch_file_mode: str = "hardlink",
     ) -> Dict:
         """Persist the current log-structured index for incremental checkpoints.
 
-        The immutable base file is referenced by absolute path. Patch files can be
-        copied into the checkpoint so resume does not depend on the original run's
-        SSD cache directory.
+        The immutable base file is referenced by absolute path. Patch files are
+        hard-linked into the checkpoint by default, avoiding duplicate physical
+        bytes while keeping the checkpoint valid after cache-side garbage collection.
         """
+        if copy_patch_files is not None:
+            if not copy_patch_files:
+                raise ValueError("Reference-only checkpoints are unsafe with patch garbage collection")
+            patch_file_mode = "copy"
+        patch_file_mode = str(patch_file_mode).lower()
+        if patch_file_mode not in {"hardlink", "copy"}:
+            raise ValueError(
+                f"Invalid patch_file_mode={patch_file_mode!r}; expected hardlink or copy"
+            )
         manifest_path = Path(manifest_path)
         patches_dir = Path(patches_dir)
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -330,8 +446,12 @@ class LogStorageManager:
         referenced_file_ids = {0}
         referenced_file_ids.update(int(location.file_id) for location in index_snapshot.values())
         files = {}
+        patch_files = 0
+        patch_bytes = 0
         copied_patch_files = 0
         copied_patch_bytes = 0
+        linked_patch_files = 0
+        linked_patch_bytes = 0
         for file_id, source_path in sorted(file_paths_snapshot.items()):
             file_id = int(file_id)
             if file_id not in referenced_file_ids:
@@ -340,23 +460,49 @@ class LogStorageManager:
             if not source_path.exists():
                 raise FileNotFoundError(f"Log storage file missing for file_id={file_id}: {source_path}")
 
-            if file_id == 0 or not copy_patch_files:
+            linked = False
+            copied = False
+            if file_id == 0:
                 checkpoint_path = source_path.resolve()
-                copied = False
             else:
                 checkpoint_path = patches_dir / source_path.name
                 if source_path.resolve() != checkpoint_path.resolve():
-                    shutil.copy2(source_path, checkpoint_path)
+                    if checkpoint_path.exists():
+                        same_file = os.path.samefile(source_path, checkpoint_path)
+                        if same_file and patch_file_mode == "hardlink":
+                            linked = True
+                        else:
+                            checkpoint_path.unlink()
+                    if not checkpoint_path.exists():
+                        if patch_file_mode == "hardlink":
+                            try:
+                                os.link(source_path, checkpoint_path)
+                                linked = True
+                            except OSError:
+                                shutil.copy2(source_path, checkpoint_path)
+                                copied = True
+                        else:
+                            shutil.copy2(source_path, checkpoint_path)
+                            copied = True
                 checkpoint_path = checkpoint_path.resolve()
-                copied = True
-                copied_patch_files += 1
-                copied_patch_bytes += int(checkpoint_path.stat().st_size)
+
+            size = int(checkpoint_path.stat().st_size)
+            if file_id != 0:
+                patch_files += 1
+                patch_bytes += size
+                if copied:
+                    copied_patch_files += 1
+                    copied_patch_bytes += size
+                if linked:
+                    linked_patch_files += 1
+                    linked_patch_bytes += size
 
             files[str(file_id)] = {
                 "path": str(checkpoint_path),
                 "role": "base" if file_id == 0 else "patch",
                 "copied": bool(copied),
-                "size": int(checkpoint_path.stat().st_size),
+                "linked": bool(linked),
+                "size": size,
             }
 
         index_payload = {
@@ -379,11 +525,20 @@ class LogStorageManager:
             "next_patch_id": int(next_patch_id),
             "files": files,
             "index": index_payload,
+            "patch_file_mode": patch_file_mode,
+            "patch_files": int(patch_files),
+            "patch_bytes": int(patch_bytes),
             "copied_patch_files": int(copied_patch_files),
             "copied_patch_bytes": int(copied_patch_bytes),
+            "linked_patch_files": int(linked_patch_files),
+            "linked_patch_bytes": int(linked_patch_bytes),
         }
-        with open(manifest_path, "w", encoding="utf-8") as handle:
+        manifest_temp = manifest_path.with_name(f".{manifest_path.name}.tmp")
+        with open(manifest_temp, "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(manifest_temp, manifest_path)
         return manifest
 
     def load_index_manifest(self, manifest_path: str | Path) -> Dict:
@@ -444,151 +599,168 @@ class LogStorageManager:
         )
         return manifest
 
-    # def compact(self, min_patches: int = 10) -> bool:
-    #     """
-    #     Compact patch files back into base file (background maintenance).
+    def _patch_state(self):
+        with self.index_lock:
+            index_snapshot = dict(self.index)
+            file_paths_snapshot = dict(self.file_paths)
+        patch_paths = {
+            int(file_id): Path(path)
+            for file_id, path in file_paths_snapshot.items()
+            if int(file_id) != 0
+        }
+        patch_bytes = sum(
+            path.stat().st_size for path in patch_paths.values() if path.exists()
+        )
+        live_block_ids = sorted(
+            block_id
+            for block_id, location in index_snapshot.items()
+            if int(location.file_id) != 0
+        )
+        live_bytes = sum(int(index_snapshot[block_id].size) for block_id in live_block_ids)
+        return index_snapshot, file_paths_snapshot, patch_paths, patch_bytes, live_block_ids, live_bytes
 
-    #     This is a placeholder for future optimization. In production:
-    #     1. Identify blocks spread across many patches
-    #     2. Rewrite them to a new base file
-    #     3. Update index and delete old patches
+    def _compaction_needed(self) -> bool:
+        _, _, patch_paths, patch_bytes, _, live_bytes = self._patch_state()
+        stale_bytes = max(0, patch_bytes - live_bytes)
+        return len(patch_paths) >= self.max_patch_files or (
+            self.max_stale_patch_bytes > 0
+            and stale_bytes >= self.max_stale_patch_bytes
+        )
 
-    #     Args:
-    #         min_patches: Minimum number of patches before compaction triggers
+    def _is_managed_patch(self, path: Path) -> bool:
+        try:
+            return (
+                path.parent.resolve() == self.storage_dir.resolve()
+                and path.name.startswith("patch_")
+                and path.suffix == ".bin"
+            )
+        except OSError:
+            return False
 
-    #     Returns:
-    #         True if compaction was performed
-    #     """
-    #     num_patches = len(self.file_paths) - 1  # Exclude base file
+    def compact_patches(self, min_patches: int = 2, force: bool = False) -> bool:
+        """Merge the latest live patch records without rewriting or deleting the base.
 
-    #     if num_patches < min_patches:
-    #         return False
+        Readers and writers pause only while a compacted delta is built and the in-memory
+        index is switched. Patch paths outside this run directory are never deleted; this
+        protects resume checkpoints and shared immutable data.
+        """
+        with self._write_lock:
+            with self._exclusive_maintenance():
+                (
+                    index_snapshot,
+                    file_paths_snapshot,
+                    patch_paths,
+                    patch_bytes,
+                    live_block_ids,
+                    live_bytes,
+                ) = self._patch_state()
+                if len(patch_paths) < max(1, int(min_patches)):
+                    return False
+                if not force and not self._compaction_needed():
+                    return False
 
-    #     print(f"[LogStorage] Compaction triggered ({num_patches} patches)")
+                start_time = time.time()
+                self._check_free_space(live_bytes, "patch compaction")
+                with self.patch_counter_lock:
+                    compacted_file_id = self.next_patch_id
+                    self.next_patch_id += 1
 
-    #     # TODO: Implement compaction logic
-    #     # 1. Create new base file
-    #     # 2. Read all blocks in order
-    #     # 3. Write to new base sequentially
-    #     # 4. Update index
-    #     # 5. Delete old patches
+                timestamp = int(time.time() * 1_000_000)
+                temp_path = self.storage_dir / f".tide_compact_{compacted_file_id:06d}_{timestamp}.tmp"
+                final_path = self.storage_dir / f"patch_{compacted_file_id:06d}_{timestamp}_compact.bin"
+                new_locations: Dict[int, BlockLocation] = {}
+                output_bytes = 0
+                switched = False
 
-    #     self.stats['compactions'] += 1
-    #     return True
+                try:
+                    with open(temp_path, "wb") as output:
+                        for chunk_start in range(0, len(live_block_ids), 256):
+                            block_ids = live_block_ids[chunk_start:chunk_start + 256]
+                            blocks = self._read_blocks_uncoordinated(block_ids)
+                            for block_id in block_ids:
+                                tensor = blocks[block_id]
+                                data = tensor.numpy().astype(np.float32, copy=False).tobytes()
+                                output.write(data)
+                                previous = index_snapshot[block_id]
+                                new_locations[block_id] = BlockLocation(
+                                    file_id=compacted_file_id,
+                                    offset=output_bytes,
+                                    size=len(data),
+                                    version=int(previous.version),
+                                )
+                                output_bytes += len(data)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.replace(temp_path, final_path)
+
+                    new_index = dict(index_snapshot)
+                    new_index.update(new_locations)
+                    new_file_paths = {0: Path(file_paths_snapshot[0])}
+                    if live_block_ids:
+                        new_file_paths[compacted_file_id] = final_path
+                    with self.index_lock:
+                        self.index = new_index
+                        self.file_paths = new_file_paths
+                        self.file_handles.clear()
+                    switched = True
+                finally:
+                    temp_path.unlink(missing_ok=True)
+                    if not switched:
+                        final_path.unlink(missing_ok=True)
+
+                managed_input_bytes = 0
+                for path in patch_paths.values():
+                    if path == final_path or not self._is_managed_patch(path):
+                        continue
+                    try:
+                        managed_input_bytes += path.stat().st_size
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+
+                self.stats["compactions"] += 1
+                self.stats["compaction_input_bytes"] += int(patch_bytes)
+                self.stats["compaction_output_bytes"] += int(output_bytes)
+                self.stats["compaction_reclaimed_bytes"] += max(
+                    0, int(managed_input_bytes) - int(output_bytes)
+                )
+                print(
+                    f"[LogStorage] Compacted {len(patch_paths)} patches into "
+                    f"{len(live_block_ids)} live blocks ({output_bytes / (1024 ** 3):.2f} GiB) "
+                    f"in {time.time() - start_time:.2f}s"
+                )
+                return True
+
+    def maybe_compact(self, min_patches: int = 2, force: bool = False) -> bool:
+        """Run maintenance when space permits, without invalidating a completed write."""
+        try:
+            return self.compact_patches(min_patches=min_patches, force=force)
+        except StorageCapacityError as exc:
+            self.stats["compactions_deferred"] += 1
+            print(f"[LogStorage] Compaction deferred: {exc}")
+            return False
 
     def compact(self, min_patches: int = 10) -> bool:
-        """
-        执行压缩：将所有零散的 Patch 和 Base 文件合并为一个新的 Base 文件。
-        """
-        # 1. 检查是否需要压缩
-        # 这里的 file_paths 包含了 base(id=0) 和 patches。减1是去掉 base。
-        current_patch_files = [pid for pid in self.file_paths if pid != 0]
-        if len(current_patch_files) < min_patches:
-            return False
-
-        print(f"[LogStorage] Compaction triggered. Merging {len(current_patch_files)} patches...")
-        start_time = time.time()
-
-        # 2. 准备新文件路径
-        timestamp = int(time.time() * 1000000)
-        new_base_path = self.storage_dir / f"base_compacted_{timestamp}.bin"
-        
-        # 3. 执行合并 (核心逻辑)
-        # 我们需要读取所有 Block 的最新数据，按顺序写入新文件
-        current_offset = 0
-        new_index_map = {} # 暂存新的索引信息
-
-        try:
-            with open(new_base_path, 'wb') as f_out:
-                # 按顺序遍历所有 Block ID
-                # 这样可以保证新文件是完美的顺序存储，读取速度最快
-                # 注意：这里我们分批读取以节省内存
-                chunk_size = 1024 # 每次处理 1024 个 Block
-                
-                for chunk_start in range(0, self.num_blocks, chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, self.num_blocks)
-                    block_ids = list(range(chunk_start, chunk_end))
-                    
-                    # 复用现有的 read_blocks 方法读取最新数据
-                    # 这会自动去各个 Patch 文件里找最新的版本
-                    blocks_data = self.read_blocks(block_ids)
-                    
-                    # 按顺序写入新文件
-                    for block_id in block_ids:
-                        if block_id not in blocks_data:
-                            # 理论上不应该发生，除非初始化有问题
-                            # 如果是空块，写入全0
-                            data_bytes = b'\0' * self.bytes_per_block
-                        else:
-                            tensor = blocks_data[block_id]
-                            data_bytes = tensor.numpy().astype(np.float32).tobytes()
-                        
-                        f_out.write(data_bytes)
-                        
-                        # 记录新位置
-                        new_index_map[block_id] = BlockLocation(
-                            file_id=0, # 重置为 Base ID (我们稍后会把这个新文件映射为 ID 0)
-                            offset=current_offset,
-                            size=len(data_bytes),
-                            version=self.index[block_id].version + 1 # 版本延续
-                        )
-                        current_offset += len(data_bytes)
-                        
-            # 确保数据落盘
-            f_out.flush()
-            os.fsync(f_out.fileno())
-
-        except Exception as e:
-            print(f"[LogStorage] Compaction failed: {e}")
-            if new_base_path.exists():
-                new_base_path.unlink() # 删除失败的临时文件
-            return False
-
-        # 4. 原子性切换 (Atomic Switch)
-        # 这是最危险的一步，需要加锁，防止此时有其他线程在读写
-        with self.index_lock:
-            with self.patch_counter_lock:
-                # A. 关闭所有旧文件句柄
-                self.close() 
-                
-                # B. 删除旧文件 (清理磁盘空间!)
-                # 注意：保留原 base_file.bin 的路径名用于重命名，或者直接用新名字
-                old_files = list(self.file_paths.values())
-                
-                # C. 更新索引
-                self.index = new_index_map
-                
-                # D. 重置文件路径映射
-                # 将新文件设为 ID 0 (Base File)
-                self.file_paths = {0: new_base_path}
-                self.file_handles = {} # 清空句柄缓存
-                
-                # E. 删除物理磁盘上的旧文件
-                for p in old_files:
-                    try:
-                        if p.exists() and p != new_base_path:
-                            p.unlink()
-                    except OSError as e:
-                        print(f"[LogStorage] Warning: Failed to delete {p}: {e}")
-
-        duration = time.time() - start_time
-        final_size_mb = current_offset / 1024 / 1024
-        print(f"[LogStorage] Compaction finished in {duration:.2f}s.")
-        print(f"[LogStorage] Merged into new base file ({final_size_mb:.2f} MB). Old patches deleted.")
-        
-        self.stats['compactions'] += 1
-        return True
+        """Compatibility wrapper for explicit maintenance callers."""
+        return self.compact_patches(min_patches=min_patches, force=True)
 
     def get_stats(self) -> Dict:
         """Get storage statistics."""
-        total_files = len(self.file_paths)
-        total_size = sum(p.stat().st_size for p in self.file_paths.values() if p.exists())
+        _, file_paths, patch_paths, patch_bytes, live_block_ids, live_bytes = self._patch_state()
+        total_files = len(file_paths)
+        total_size = sum(p.stat().st_size for p in file_paths.values() if p.exists())
+        free_bytes = shutil.disk_usage(self.storage_dir).free
 
         return {
             **self.stats,
             'total_files': total_files,
             'total_size_mb': total_size / 1024 / 1024,
-            'num_patches': total_files - 1
+            'num_patches': len(patch_paths),
+            'patch_size_mb': patch_bytes / 1024 / 1024,
+            'live_patch_blocks': len(live_block_ids),
+            'live_patch_size_mb': live_bytes / 1024 / 1024,
+            'stale_patch_size_mb': max(0, patch_bytes - live_bytes) / 1024 / 1024,
+            'free_space_gb': free_bytes / (1024 ** 3),
         }
 
     def close(self):

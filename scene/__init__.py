@@ -152,37 +152,48 @@ class Scene:
         # Preprocess dataset
         # Train on original resolution, no downsampling in our implementation.
 
-        # Predecode dataset as raw files to local disk
-        # If decode_dataset_path does not exist, run predecode
-        if args.decode_dataset_path == "":
-            args.decode_dataset_path = os.path.join(
-                args.source_path, f"decoded_{args.images}"
-            )
-            os.makedirs(args.decode_dataset_path, exist_ok=True)
-            print("create folder: ", args.decode_dataset_path)
-            log_file.write(f"create folder: {args.decode_dataset_path}\n")
+        image_mode = args.dataset_cache_and_stream_mode
+        do_decode = False
+        self.decode_dataset_path = None
+        if image_mode == "load_from_source_on_demand":
+            log_file.write("[DATASET] Loading source images on demand\n")
+        elif image_mode == "load_from_disk_on_demand":
+            if args.decode_dataset_path == "":
+                args.decode_dataset_path = os.path.join(
+                    args.source_path, f"decoded_{args.images}"
+                )
+                os.makedirs(args.decode_dataset_path, exist_ok=True)
+                print("create folder: ", args.decode_dataset_path)
+                log_file.write(f"create folder: {args.decode_dataset_path}\n")
 
-        self.decode_dataset_path = os.path.join(args.decode_dataset_path, "dataset_raw")
-
-        if not os.path.isdir(self.decode_dataset_path):
-            os.makedirs(self.decode_dataset_path)
-            statvfs = os.statvfs(args.decode_dataset_path)
-            available_space_in_GB = 1.0 * statvfs.f_frsize * statvfs.f_bavail / 1e9
-            assert (
-                available_space_in_GB >= dataset_size_in_GB
-            ), f"Not enough space in disk for decompressed dataset. avail: {available_space_in_GB}. need: {dataset_size_in_GB}"
-            log_file.write(
-                f"[NOTE]: Pre-decoding dataset({dataset_size_in_GB}GB) to disk dir: {self.decode_dataset_path}\n"
+            self.decode_dataset_path = os.path.join(
+                args.decode_dataset_path, "dataset_raw"
             )
-            do_decode = True
+            if not os.path.isdir(self.decode_dataset_path):
+                os.makedirs(self.decode_dataset_path)
+                statvfs = os.statvfs(args.decode_dataset_path)
+                available_space_in_GB = (
+                    1.0 * statvfs.f_frsize * statvfs.f_bavail / 1e9
+                )
+                assert available_space_in_GB >= dataset_size_in_GB, (
+                    "Not enough space in disk for decompressed dataset. "
+                    f"avail: {available_space_in_GB}. need: {dataset_size_in_GB}"
+                )
+                log_file.write(
+                    f"[NOTE]: Pre-decoding dataset({dataset_size_in_GB}GB) "
+                    f"to disk dir: {self.decode_dataset_path}\n"
+                )
+                do_decode = True
+            else:
+                log_file.write(
+                    f"[NOTE]: Reusing decoded dataset({dataset_size_in_GB}GB) "
+                    f"in disk dir: {self.decode_dataset_path}\n"
+                )
+                utils.print_rank_0(
+                    f"Reusing decoded dataset on disk: {self.decode_dataset_path}"
+                )
         else:
-            log_file.write(
-                f"[NOTE]: Reusing decoded dataset({dataset_size_in_GB}GB) in disk dir: {self.decode_dataset_path}\n"
-            )
-            utils.print_rank_0(
-                f"Reusing decoded dataset on disk: {self.decode_dataset_path}"
-            )
-            do_decode = False
+            raise ValueError(f"Unsupported dataset image mode: {image_mode}")
 
         self.train_cameras = None
         self.test_cameras = None
@@ -532,6 +543,13 @@ class OffloadSceneDataset(Dataset):
         return self.camera_size
 
     def __getitem__(self, id):
+        if self.args.dataset_cache_and_stream_mode == "load_from_source_on_demand":
+            return loadCam(
+                self.args,
+                id,
+                self.cameras_info[id],
+                offload=True,
+            )
         return loadCam_raw_from_disk(
             self.args,
             id,

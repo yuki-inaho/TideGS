@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
+from queue import Queue
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -37,6 +40,46 @@ def _link_resume_base_file(source_base_file: Path, active_storage_dir: Path) -> 
     return active_base_file
 
 
+class _CacheCommitJob:
+    def __init__(
+        self,
+        payload,
+        block_ids: List[int],
+        bounds_managed_externally: bool = False,
+    ):
+        self.payload = payload
+        self.block_ids = tuple(sorted(set(int(block_id) for block_id in block_ids)))
+        self.bounds_managed_externally = bool(bounds_managed_externally)
+        self.done = threading.Event()
+        self.result = 0
+        self.error = None
+
+    def wait_gpu(self) -> None:
+        wait_gpu = getattr(self.payload, "wait_gpu", None)
+        if callable(wait_gpu):
+            wait_gpu()
+
+    def wait(self) -> int:
+        self.done.wait()
+        if self.error is not None:
+            raise RuntimeError("background cache commit failed") from self.error
+        return int(self.result)
+
+
+class _BoundsRefreshJob:
+    def __init__(self, payload):
+        self.payload = payload
+        self.done = threading.Event()
+        self.result = 0
+        self.error = None
+
+    def wait(self) -> int:
+        self.done.wait()
+        if self.error is not None:
+            raise RuntimeError("background bounds refresh failed") from self.error
+        return int(self.result)
+
+
 class TideStorageAdapter:
     """Adapter for the out-of-core SSD training path."""
 
@@ -51,12 +94,18 @@ class TideStorageAdapter:
         skip_camera_clustering: bool = False,
         use_6plane: bool = True,
         execution_mode: str = "paper",
+        max_patch_files: int = 16,
+        max_patch_gb: float = 64.0,
+        min_free_gb: float = 64.0,
     ):
         self.gaussians = gaussians
         self.cameras = cameras
         self.skip_camera_clustering = skip_camera_clustering
         self.use_6plane = use_6plane
         self.execution_mode = str(execution_mode).lower()
+        self.max_patch_files = int(max_patch_files)
+        self.max_patch_gb = float(max_patch_gb)
+        self.min_free_gb = float(min_free_gb)
         self.paper_debug_logging = bool(
             getattr(getattr(self.gaussians, "args", None), "paper_debug_logging", False)
         )
@@ -85,7 +134,31 @@ class TideStorageAdapter:
             "paper_cache_sync_blocks": 0,
             "paper_cache_sync_staged_blocks": 0,
             "paper_bounds_refresh_blocks": 0,
+            "background_cache_commit_jobs": 0,
+            "background_cache_commit_blocks": 0,
+            "background_cache_commit_waits": 0,
+            "background_bounds_jobs": 0,
+            "background_bounds_blocks": 0,
+            "background_bounds_waits": 0,
+            "visibility_full_culls": 0,
+            "visibility_incremental_repairs": 0,
+            "visibility_repaired_blocks": 0,
         }
+        self._cache_commit_queue: Queue = Queue()
+        self._cache_commit_lock = threading.RLock()
+        self._pending_cache_commits: Dict[int, _CacheCommitJob] = {}
+        self._cache_commit_error = None
+        self._cache_commit_thread = None
+        self._bounds_refresh_queue: Queue = Queue()
+        self._bounds_refresh_error = None
+        self._bounds_refresh_thread = None
+        self._resident_state = None
+        self._resident_working_set = None
+        self._bounds_state_lock = threading.RLock()
+        self._bounds_generation = 0
+        self._visibility_cache = {}
+        self._bounds_change_log = OrderedDict()
+        self._bounds_change_history_limit = 64
         self.streaming_init_manifest = None
 
         resume_manifest = getattr(gaussians, "_pure_ssd_resume_manifest", None)
@@ -123,6 +196,8 @@ class TideStorageAdapter:
         self._log(f"[TideStorageAdapter] Execution mode: {self.execution_mode}")
 
         self._initialize_storage()
+        self._start_cache_commit_worker()
+        self._start_bounds_refresh_worker()
         if self.skip_camera_clustering:
             self._log("[TideStorageAdapter] Skipping camera scheduling")
             self.camera_clusters = None
@@ -138,6 +213,172 @@ class TideStorageAdapter:
 
     def _warn(self, message: str) -> None:
         print(message)
+
+    def _start_cache_commit_worker(self) -> None:
+        self._cache_commit_thread = threading.Thread(
+            target=self._cache_commit_worker,
+            name="tide-cache-commit",
+            daemon=True,
+        )
+        self._cache_commit_thread.start()
+
+    def _cache_commit_worker(self) -> None:
+        while True:
+            job = self._cache_commit_queue.get()
+            if job is None:
+                self._cache_commit_queue.task_done()
+                return
+            try:
+                updated_blocks = job.payload.wait()
+                job.result = self.sync_cache_from_cpu_views(
+                    updated_blocks,
+                    refresh_bounds=not job.bounds_managed_externally,
+                )
+            except Exception as exc:
+                job.error = exc
+                self._cache_commit_error = exc
+            finally:
+                release = getattr(job.payload, "release", None)
+                if callable(release):
+                    release()
+                with self._cache_commit_lock:
+                    for block_id in job.block_ids:
+                        if self._pending_cache_commits.get(block_id) is job:
+                            self._pending_cache_commits.pop(block_id, None)
+                job.done.set()
+                self._cache_commit_queue.task_done()
+
+    def _start_bounds_refresh_worker(self) -> None:
+        self._bounds_refresh_thread = threading.Thread(
+            target=self._bounds_refresh_worker,
+            name="tide-bounds-refresh",
+            daemon=True,
+        )
+        self._bounds_refresh_thread.start()
+
+    def _bounds_refresh_worker(self) -> None:
+        while True:
+            job = self._bounds_refresh_queue.get()
+            if job is None:
+                self._bounds_refresh_queue.task_done()
+                return
+            try:
+                with torch.cuda.nvtx.range("Tide bounds: wait D2H"):
+                    block_ids, bounds = job.payload.wait()
+                with torch.cuda.nvtx.range("Tide bounds: publish generation"):
+                    job.result = self.update_block_bounds(block_ids, bounds)
+            except Exception as exc:
+                job.error = exc
+                self._bounds_refresh_error = exc
+            finally:
+                job.done.set()
+                self._bounds_refresh_queue.task_done()
+
+    def submit_bounds_refresh(self, payload) -> int:
+        if payload is None:
+            return 0
+        block_ids = list(getattr(payload, "block_ids", []))
+        if not block_ids:
+            return 0
+        self.execution_metrics["background_bounds_jobs"] += 1
+        self.execution_metrics["background_bounds_blocks"] += len(block_ids)
+        self._bounds_refresh_queue.put(_BoundsRefreshJob(payload))
+        return len(block_ids)
+
+    def wait_for_bounds_refresh(self) -> None:
+        if self._bounds_refresh_queue.unfinished_tasks:
+            self.execution_metrics["background_bounds_waits"] += 1
+        self._bounds_refresh_queue.join()
+        if self._bounds_refresh_error is not None:
+            raise RuntimeError("background bounds refresh worker failed") from self._bounds_refresh_error
+
+    def submit_cache_writeback(
+        self,
+        payload,
+        *,
+        bounds_managed_externally: bool = False,
+    ) -> int:
+        block_ids = list(getattr(payload, "block_ids", []))
+        if not block_ids:
+            release = getattr(payload, "release", None)
+            if callable(release):
+                release()
+            return 0
+
+        job = _CacheCommitJob(
+            payload,
+            block_ids,
+            bounds_managed_externally=bounds_managed_externally,
+        )
+        with self._cache_commit_lock:
+            for block_id in job.block_ids:
+                self._pending_cache_commits[block_id] = job
+        self.execution_metrics["background_cache_commit_jobs"] += 1
+        self.execution_metrics["background_cache_commit_blocks"] += len(job.block_ids)
+        self._cache_commit_queue.put(job)
+        return len(job.block_ids)
+
+    def bind_resident_writeback(self, resident_state, working_set) -> None:
+        self._resident_state = resident_state
+        self._resident_working_set = working_set
+
+    def flush_resident_dirty(self) -> int:
+        resident_state = self._resident_state
+        working_set = self._resident_working_set
+        if resident_state is None or working_set is None:
+            return 0
+
+        dirty_blocks = resident_state.dirty_blocks()
+        if not dirty_blocks:
+            return 0
+        payload = working_set.stage_updated_blocks(dirty_blocks)
+        if payload is None or set(payload.block_ids) != set(dirty_blocks):
+            staged_ids = [] if payload is None else payload.block_ids
+            raise RuntimeError(
+                "Cannot flush all GPU-dirty resident blocks: "
+                f"dirty={dirty_blocks[:8]} staged={staged_ids[:8]}"
+            )
+        staged = self.submit_cache_writeback(payload)
+        if staged != len(dirty_blocks):
+            raise RuntimeError(
+                f"GPU-dirty flush staged {staged}/{len(dirty_blocks)} blocks"
+            )
+        resident_state.mark_blocks_written_back(dirty_blocks)
+        self.drain_cache_writebacks()
+        return staged
+
+    def wait_for_cache_blocks(self, block_ids: List[int]) -> None:
+        if self._cache_commit_error is not None:
+            raise RuntimeError("background cache commit worker failed") from self._cache_commit_error
+        requested = set(int(block_id) for block_id in block_ids)
+        while requested:
+            with self._cache_commit_lock:
+                jobs = {
+                    self._pending_cache_commits[block_id]
+                    for block_id in requested
+                    if block_id in self._pending_cache_commits
+                }
+            if not jobs:
+                return
+            self.execution_metrics["background_cache_commit_waits"] += 1
+            for job in jobs:
+                job.wait()
+
+    def filter_cache_prefetch_candidates(self, block_ids: List[int]) -> List[int]:
+        with self._cache_commit_lock:
+            pending = set(self._pending_cache_commits)
+        return [int(block_id) for block_id in block_ids if int(block_id) not in pending]
+
+    def wait_for_pending_gpu_copies(self) -> None:
+        with self._cache_commit_lock:
+            jobs = set(self._pending_cache_commits.values())
+        for job in jobs:
+            job.wait_gpu()
+
+    def drain_cache_writebacks(self) -> None:
+        self._cache_commit_queue.join()
+        if self._cache_commit_error is not None:
+            raise RuntimeError("background cache commit worker failed") from self._cache_commit_error
 
     def _init_from_resume_manifest(
         self,
@@ -247,6 +488,9 @@ class TideStorageAdapter:
             num_blocks=self.num_blocks,
             point_dim=59,
             verbose=self.paper_debug_logging,
+            max_patch_files=self.max_patch_files,
+            max_patch_gb=self.max_patch_gb,
+            min_free_gb=self.min_free_gb,
         )
         storage_index = None
         if self.streaming_init_manifest:
@@ -425,11 +669,19 @@ class TideStorageAdapter:
         )
         return schedule
 
-    def get_visible_blocks(self, camera_idx: int) -> List[int]:
-        if not hasattr(self, "_visibility_cache"):
-            self._visibility_cache = {}
-        if camera_idx in self._visibility_cache:
-            return self._visibility_cache[camera_idx]
+    def get_visible_blocks(
+        self,
+        camera_idx: int,
+        *,
+        wait_for_refresh: bool = True,
+    ) -> List[int]:
+        if wait_for_refresh:
+            self.wait_for_bounds_refresh()
+        camera_idx = int(camera_idx)
+        with self._bounds_state_lock:
+            cached = self._visibility_cache.get(camera_idx)
+            if cached is not None and cached[0] == self._bounds_generation:
+                return list(cached[1])
 
         cam_info = self.cameras[camera_idx]
         R = np.array(cam_info.R).reshape(3, 3)
@@ -497,12 +749,43 @@ class TideStorageAdapter:
             print(f"[COORD_CHECK] Proj[2,2]={proj_mat[2, 2]:.6f} (OpenGL: should be < 0)")
             print(f"[COORD_CHECK] near={near}, far={far}, scene_radius={self.scene_radius}")
 
-        visible_blocks = self.culler.cull(
-            camera_position=camera_pos,
-            view_matrix=view_mat,
-            projection_matrix=proj_mat,
-            use_6plane=self.use_6plane,
-        )
+        with self._bounds_state_lock:
+            bounds_generation = self._bounds_generation
+            changed_blocks = self._changed_blocks_since_locked(
+                cached[0] if cached is not None else None,
+                bounds_generation,
+            )
+            can_repair = (
+                cached is not None
+                and changed_blocks is not None
+                and len(changed_blocks) < int(self.culler.num_blocks)
+                and hasattr(self.culler, "cull_subset")
+            )
+            if can_repair:
+                changed_visible = self.culler.cull_subset(
+                    camera_position=camera_pos,
+                    view_matrix=view_mat,
+                    projection_matrix=proj_mat,
+                    block_ids=changed_blocks,
+                    use_6plane=self.use_6plane,
+                )
+                visible_set = set(cached[1])
+                visible_set.difference_update(changed_blocks)
+                visible_set.update(changed_visible)
+                visible_blocks = sorted(visible_set)
+                self.execution_metrics.setdefault("visibility_incremental_repairs", 0)
+                self.execution_metrics.setdefault("visibility_repaired_blocks", 0)
+                self.execution_metrics["visibility_incremental_repairs"] += 1
+                self.execution_metrics["visibility_repaired_blocks"] += len(changed_blocks)
+            else:
+                visible_blocks = self.culler.cull(
+                    camera_position=camera_pos,
+                    view_matrix=view_mat,
+                    projection_matrix=proj_mat,
+                    use_6plane=self.use_6plane,
+                )
+                self.execution_metrics.setdefault("visibility_full_culls", 0)
+                self.execution_metrics["visibility_full_culls"] += 1
 
         if self.paper_debug_logging:
             if not hasattr(self, "_logged_cameras"):
@@ -516,12 +799,47 @@ class TideStorageAdapter:
                     )
                     self._logged_cameras.add(camera_idx)
 
-        self._visibility_cache[camera_idx] = visible_blocks
-        if len(self._visibility_cache) > 500:
-            oldest_key = next(iter(self._visibility_cache))
-            del self._visibility_cache[oldest_key]
+        with self._bounds_state_lock:
+            if bounds_generation == self._bounds_generation:
+                self._visibility_cache[camera_idx] = (
+                    bounds_generation,
+                    tuple(visible_blocks),
+                )
+                if len(self._visibility_cache) > 500:
+                    oldest_key = next(iter(self._visibility_cache))
+                    del self._visibility_cache[oldest_key]
 
         return visible_blocks
+
+    def _changed_blocks_since_locked(self, cached_generation, current_generation):
+        if cached_generation is None or cached_generation > current_generation:
+            return None
+        if cached_generation == current_generation:
+            return set()
+
+        change_log = getattr(self, "_bounds_change_log", None)
+        if change_log is None:
+            return None
+        changed = set()
+        for generation in range(int(cached_generation) + 1, int(current_generation) + 1):
+            generation_blocks = change_log.get(generation)
+            if generation_blocks is None:
+                return None
+            changed.update(generation_blocks)
+        return changed
+
+    def get_visible_blocks_batch(self, camera_ids: List[int]):
+        self.wait_for_bounds_refresh()
+        with self._bounds_state_lock:
+            generation = int(self._bounds_generation)
+            camera_blocks = {
+                int(camera_id): self.get_visible_blocks(
+                    int(camera_id),
+                    wait_for_refresh=False,
+                )
+                for camera_id in camera_ids
+            }
+        return generation, camera_blocks
 
     def prefetch_for_next_iteration(
         self,
@@ -597,35 +915,65 @@ class TideStorageAdapter:
         if not block_ids:
             return 0
 
-        block_ids_np = np.asarray(block_ids, dtype=np.int64)
-        bounds_np = np.stack(bounds, axis=0).astype(np.float32, copy=False)
-        if not self.block_bounds.flags.writeable:
-            self.block_bounds = np.array(self.block_bounds, dtype=np.float32, copy=True)
-        self.block_bounds[block_ids_np] = bounds_np
+        return self.update_block_bounds(block_ids, np.stack(bounds, axis=0))
 
-        culler = getattr(self, "culler", None)
-        if culler is not None and hasattr(culler, "update_block_bounds"):
-            culler.update_block_bounds(block_ids_np, bounds_np)
+    def update_block_bounds(self, block_ids, bounds) -> int:
+        block_ids_np = np.asarray(block_ids, dtype=np.int64)
+        if torch.is_tensor(bounds):
+            bounds = bounds.detach().cpu().numpy()
+        bounds_np = np.asarray(bounds, dtype=np.float32)
+        if bounds_np.shape != (block_ids_np.size, 6):
+            raise ValueError(
+                f"Expected bounds shape {(block_ids_np.size, 6)}, got {bounds_np.shape}"
+            )
+        with self._bounds_state_lock:
+            if not self.block_bounds.flags.writeable:
+                self.block_bounds = np.array(self.block_bounds, dtype=np.float32, copy=True)
+            self.block_bounds[block_ids_np] = bounds_np
+
+            culler = getattr(self, "culler", None)
+            if culler is not None and hasattr(culler, "update_block_bounds"):
+                culler.update_block_bounds(block_ids_np, bounds_np)
+            self._bounds_generation += 1
+            if not hasattr(self, "_bounds_change_log"):
+                self._bounds_change_log = OrderedDict()
+            generation = int(self._bounds_generation)
+            self._bounds_change_log[generation] = tuple(
+                sorted(set(int(block_id) for block_id in block_ids_np.tolist()))
+            )
+            history_limit = int(getattr(self, "_bounds_change_history_limit", 64))
+            while len(self._bounds_change_log) > history_limit:
+                self._bounds_change_log.popitem(last=False)
 
         refreshed = int(block_ids_np.size)
         self.execution_metrics["paper_bounds_refresh_blocks"] += refreshed
         return refreshed
 
-    def sync_cache_from_cpu_views(self, updated_blocks_dict: Dict[int, torch.Tensor]):
+    def get_bounds_generation(self) -> int:
+        with self._bounds_state_lock:
+            return int(self._bounds_generation)
+
+    def sync_cache_from_cpu_views(
+        self,
+        updated_blocks_dict: Dict[int, torch.Tensor],
+        *,
+        refresh_bounds: bool = True,
+    ):
         if not updated_blocks_dict:
             return 0
 
         staged = len(updated_blocks_dict)
         self.execution_metrics["paper_cache_sync_calls"] += 1
         self.execution_metrics["paper_cache_sync_blocks"] += staged
-        staged_valid = self.cache.upsert_dirty_blocks(updated_blocks_dict, clone=True)
+        staged_valid = self.cache.upsert_dirty_block_batch(updated_blocks_dict)
         self.execution_metrics["paper_cache_sync_staged_blocks"] += staged_valid
-        self.refresh_block_bounds_from_blocks(updated_blocks_dict)
+        if refresh_bounds:
+            self.refresh_block_bounds_from_blocks(updated_blocks_dict)
         return staged_valid
 
     def async_sync_updated_blocks(self, updated_blocks_dict: Dict[int, torch.Tensor]):
         if updated_blocks_dict:
-            self.cache.upsert_dirty_blocks(updated_blocks_dict, clone=True)
+            self.cache.upsert_dirty_block_batch(updated_blocks_dict)
             self.refresh_block_bounds_from_blocks(updated_blocks_dict)
 
     def get_stats(self) -> Dict:
@@ -638,7 +986,19 @@ class TideStorageAdapter:
 
     def shutdown(self) -> None:
         self._log("[TideStorageAdapter] Shutting down...")
+        self.flush_resident_dirty()
+        self.drain_cache_writebacks()
+        self._cache_commit_queue.put(None)
+        self._cache_commit_queue.join()
+        if self._cache_commit_thread is not None:
+            self._cache_commit_thread.join(timeout=5.0)
+        self.wait_for_bounds_refresh()
+        self._bounds_refresh_queue.put(None)
+        self._bounds_refresh_queue.join()
+        if self._bounds_refresh_thread is not None:
+            self._bounds_refresh_thread.join(timeout=5.0)
         self.pipeline.shutdown()
         self.cache.shutdown()
+        self.storage.maybe_compact(min_patches=2, force=True)
         self.storage.close()
         self._log("[TideStorageAdapter] Shutdown complete")

@@ -19,15 +19,21 @@ def get_gpu_resident_optimizer(gaussians, batch_size):
         )
     )
     current_optimizer = getattr(gaussians, '_paper_gpu_resident_optimizer', None)
+    desired_capacity = max(
+        0,
+        int(getattr(getattr(gaussians, 'args', None), 'paper_resident_capacity_blocks', 0)),
+    )
     needs_recreate = (
         current_optimizer is None
         or getattr(current_optimizer, 'batch_size', None) != batch_size
         or getattr(current_optimizer, 'block_size', desired_block_size) != desired_block_size
+        or getattr(current_optimizer, 'capacity_blocks', desired_capacity) != desired_capacity
     )
     if needs_recreate:
         gaussians._paper_gpu_resident_optimizer = GPUResidentAdam(
             batch_size=batch_size,
             block_size=desired_block_size,
+            capacity_blocks=desired_capacity,
             device='cuda',
         )
     return gaussians._paper_gpu_resident_optimizer
@@ -141,12 +147,10 @@ from strategies.tide_engine.runtime import (
     collect_camera_visible_blocks as _collect_camera_visible_blocks,
     collect_paper_updated_block_ids as _collect_paper_updated_block_ids,
     configure_gpu_resident_optimizer_state as _configure_gpu_resident_optimizer_state,
-    compute_paper_block_sets as _compute_paper_block_sets,
     initialize_paper_mode_runtime_state as _initialize_paper_mode_runtime_state,
     log_batch_kt_metrics as _log_batch_kt_metrics,
-    log_delta_refresh as _log_delta_refresh,
+    log_delta_handoff as _log_delta_handoff,
     log_delta_stream_prefetch as _log_delta_stream_prefetch,
-    log_ab_buffer_prefetch_failure as _log_ab_buffer_prefetch_failure,
     log_double_buffer_stats as _log_double_buffer_stats,
     log_empty_microbatch_camera as _log_empty_microbatch_camera,
     log_empty_paper_projection_cameras as _log_empty_paper_projection_cameras,
@@ -165,13 +169,14 @@ from strategies.tide_engine.runtime import (
     log_paper_order_calculation_skip as _log_paper_order_calculation_skip,
     log_paper_resident_camera_coverage as _log_paper_resident_camera_coverage,
     log_paper_sh_indexed as _log_paper_sh_indexed,
-    log_paper_working_set_cleared as _log_paper_working_set_cleared,
+    log_paper_working_set_retained as _log_paper_working_set_retained,
     log_paper_working_set_loaded as _log_paper_working_set_loaded,
     log_paper_writeback_finalize as _log_paper_writeback_finalize,
     log_paper_writeback_staged as _log_paper_writeback_staged,
     load_paper_stage1_working_set as _load_paper_stage1_working_set,
     map_compact_filters_to_global as _map_compact_filters_to_global,
     paper_debug_logging_enabled as _paper_debug_logging_enabled,
+    plan_and_start_resident_prefetch as _plan_and_start_resident_prefetch,
     resolve_paper_stage0_active_blocks as _resolve_paper_stage0_active_blocks,
     resolve_current_iteration_resident_blocks as _resolve_current_iteration_resident_blocks,
     resolve_stage2_loaded_gaussian_ids as _resolve_stage2_loaded_gaussian_ids,
@@ -430,90 +435,13 @@ def _build_updated_blocks_dict_from_gpu(
     total_n_gaussians: int,
     block_size: int,
     gpu_working_set_manager,
-) -> Dict[int, torch.Tensor]:
-    """Phase 3B: direct GPU → per-block CPU writeback path.
-
-    Collects updated blocks from the GPU working set, performs ONE batched
-    ``.cpu()`` transfer per parameter component, and assembles per-block
-    ``(rows, 59)`` tensors in the SSD / TieredCache column layout
-    (``xyz | scaling | rotation | opacity | features_dc | features_rest``).
-
-    This replaces the older two-stage path that went:
-        GPU -> original_xyz (view into _unified_params)
-            -> _materialize_updated_blocks_from_cpu_views (per-block torch.cat)
-
-    The round-trip through ``_unified_params`` is eliminated, which both
-    halves the wall-clock writeback cost and (more importantly) frees the
-    caller from having to keep ``_unified_params`` RAM-resident at all.
-    """
+):
+    """Start a pinned, batched D2H writeback for the updated resident blocks."""
     if gpu_working_set_manager is None or not updated_block_ids:
         return {}
-
-    plans: List[Tuple[int, slice, int]] = []
-    for block_id in updated_block_ids:
-        local_slice = gpu_working_set_manager.block_to_gpu_slice.get(block_id)
-        if local_slice is None:
-            continue
-        start_idx = block_id * block_size
-        end_idx = min(start_idx + block_size, total_n_gaussians)
-        row_count = max(0, end_idx - start_idx)
-        if row_count <= 0:
-            continue
-        local_len = int(local_slice.stop - local_slice.start)
-        if local_len <= 0:
-            continue
-        if local_len != row_count:
-            row_count = min(row_count, local_len)
-            if row_count <= 0:
-                continue
-            local_slice = slice(local_slice.start, local_slice.start + row_count)
-        plans.append((int(block_id), local_slice, row_count))
-
-    if not plans:
-        return {}
-
-    local_slices = [plan[1] for plan in plans]
-    with torch.no_grad():
-        # One GPU-side gather + one D2H per component (6 total).
-        xyz_cpu = torch.cat(
-            [gpu_working_set_manager.gpu_xyz[s] for s in local_slices], dim=0
-        ).detach().cpu()
-        scaling_cpu = torch.cat(
-            [gpu_working_set_manager.gpu_scaling[s] for s in local_slices], dim=0
-        ).detach().cpu()
-        rotation_cpu = torch.cat(
-            [gpu_working_set_manager.gpu_rotation[s] for s in local_slices], dim=0
-        ).detach().cpu()
-        opacity_cpu = torch.cat(
-            [gpu_working_set_manager.gpu_opacity[s] for s in local_slices], dim=0
-        ).detach().cpu()
-        features_dc_cpu = torch.cat(
-            [gpu_working_set_manager.gpu_features_dc[s] for s in local_slices], dim=0
-        ).detach().cpu()
-        features_rest_cpu = torch.cat(
-            [gpu_working_set_manager.gpu_features_rest[s] for s in local_slices], dim=0
-        ).detach().cpu()
-
-    # Per-block assembly in CACHE layout (xyz | scaling | rotation | opacity
-    # | features_dc | features_rest).  The concatenation is a pure CPU
-    # operation on small tensors so it is negligible compared to the D2H.
-    updated_blocks_dict: Dict[int, torch.Tensor] = {}
-    cpu_offset = 0
-    for block_id, _, row_count in plans:
-        tail = cpu_offset + row_count
-        updated_blocks_dict[block_id] = torch.cat([
-            xyz_cpu[cpu_offset:tail],
-            scaling_cpu[cpu_offset:tail],
-            rotation_cpu[cpu_offset:tail],
-            opacity_cpu[cpu_offset:tail],
-            features_dc_cpu[cpu_offset:tail],
-            features_rest_cpu[cpu_offset:tail],
-        ], dim=1)
-        if updated_blocks_dict[block_id].numel() == 0:
-            updated_blocks_dict.pop(block_id, None)
-        cpu_offset = tail
-
-    return updated_blocks_dict
+    _ = total_n_gaussians, block_size
+    pending = gpu_working_set_manager.stage_updated_blocks(updated_block_ids)
+    return pending if pending is not None else {}
 
 
 def visualize_frustum_culling_inline(
@@ -1009,15 +937,16 @@ def clm_offload_train_one_batch(
         )
 
         # Step 1: collect coarse block visibility for this camera batch.
-        visible_block_ids_set = set()
-        current_camera_blocks: Dict[int, List[int]] = {}
-        cam_to_blocks = {}  # Track per-camera block visibility
-        for i, camera in enumerate(batched_cameras):
-            cam_global_idx = current_camera_ids[i]
-            blocks = storage_adapter.get_visible_blocks(cam_global_idx)
-            visible_block_ids_set.update(blocks)
-            current_camera_blocks[int(cam_global_idx)] = list(blocks)
-            cam_to_blocks[cam_global_idx] = len(blocks)
+        with torch.cuda.nvtx.range("Tide activation: current block culling"):
+            _, current_camera_blocks = storage_adapter.get_visible_blocks_batch(
+                current_camera_ids
+            )
+            visible_block_ids_set = set()
+            cam_to_blocks = {}  # Track per-camera block visibility
+            for cam_global_idx in current_camera_ids:
+                blocks = current_camera_blocks[int(cam_global_idx)]
+                visible_block_ids_set.update(blocks)
+                cam_to_blocks[cam_global_idx] = len(blocks)
 
         visible_block_ids = sorted(list(visible_block_ids_set))
         
@@ -1072,8 +1001,8 @@ def clm_offload_train_one_batch(
             )
 
         paper_block_sets = None
+        paper_plan_future = None
         paper_ab_buffer_source = None
-        paper_delta_future_submitted_early = 0
         should_log_paper_sets = is_paper_ssd_mode and (iteration == 1 or _perf_log or iteration % 500 == 0)
         resident_recency_scores = dict(
             getattr(gaussians, '_paper_resident_recency_scores', {})
@@ -1264,6 +1193,10 @@ def clm_offload_train_one_batch(
                         block_size=args.gaussian_block_size,
                         device='cuda'
                     )
+                    storage_adapter.bind_resident_writeback(
+                        double_buffer,
+                        gaussians.gpu_working_set_manager,
+                    )
                     _seed_paper_active_buffer_from_manager(
                         gaussians,
                         double_buffer,
@@ -1271,40 +1204,27 @@ def clm_offload_train_one_batch(
                         preserve_resident_metadata=used_paper_prefetch_buffer,
                     )
                     actual_current_resident_blocks = list(gaussians.gpu_working_set_manager.loaded_blocks)
-                    paper_block_sets = _compute_paper_block_sets(
+                    gaussians._paper_loaded_resident_blocks = list(actual_current_resident_blocks)
+                    active_block_reader = getattr(gaussians, '_block_reader', None)
+                    paper_plan_future = double_buffer.submit_resident_plan(
+                        iteration,
+                        _plan_and_start_resident_prefetch,
                         storage_adapter=storage_adapter,
                         training_schedule=training_schedule,
                         iteration=iteration,
                         batch_size=bsz,
-                        current_block_ids=visible_block_ids,
+                        current_block_ids=list(visible_block_ids),
                         schedule_ordering=getattr(args, 'ssd_schedule_ordering', 'trajectory'),
-                        current_resident_blocks=actual_current_resident_blocks,
-                        current_resident_recency_scores=resident_recency_scores,
+                        current_resident_blocks=list(actual_current_resident_blocks),
+                        current_resident_recency_scores=dict(resident_recency_scores),
                         resident_selection_policy=args.paper_resident_selection_policy,
                         resident_lambda=args.paper_resident_lambda,
                         resident_recency_decay=args.paper_resident_recency_decay,
                         resident_capacity_blocks=args.paper_resident_capacity_blocks,
                         balanced_seed_fraction=float(getattr(args, 'paper_balanced_seed_fraction', 1.0)),
+                        active_block_reader=active_block_reader,
+                        double_buffer=double_buffer,
                     )
-                    gaussians._paper_loaded_resident_blocks = list(actual_current_resident_blocks)
-                    gaussians._paper_expected_resident_blocks = list(
-                        paper_block_sets['next_resident_blocks']
-                    )
-                    gaussians._paper_resident_recency_scores = dict(
-                        paper_block_sets.get('updated_recency_scores', {})
-                    )
-                    stream_in_for_next = list(paper_block_sets.get('stream_in_blocks', []))
-                    active_block_reader = getattr(gaussians, '_block_reader', None)
-                    if active_block_reader is not None and stream_in_for_next:
-                        paper_delta_future_submitted_early = int(active_block_reader.hint_future(stream_in_for_next) or 0)
-                        if should_log_paper_sets:
-                            _log_early_delta_hint(
-                                storage_adapter=storage_adapter,
-                                iteration=iteration,
-                                submitted=paper_delta_future_submitted_early,
-                                requested=len(stream_in_for_next),
-                                log_file=log_file,
-                            )
                     _configure_gpu_resident_optimizer_state(
                         gaussians=gaussians,
                         args=args,
@@ -1314,12 +1234,6 @@ def clm_offload_train_one_batch(
                         log_file=log_file,
                     )
                     if should_log_paper_sets:
-                        _log_paper_block_sets(
-                            log_file=log_file,
-                            iteration=iteration,
-                            current_camera_ids=current_camera_ids,
-                            block_sets=paper_block_sets,
-                        )
                         _log_batch_kt_metrics(
                             log_file=log_file,
                             iteration=iteration,
@@ -1343,16 +1257,6 @@ def clm_offload_train_one_batch(
                 # Mode-specific logging: paper working-set semantics vs. archived retention stats.
                 # ============================================================
                 if is_paper_ssd_mode:
-                    if should_log_paper_sets and paper_block_sets is not None:
-                        load_source = paper_ab_buffer_source or retention_stats.get('source', 'sync_ram_to_gpu')
-                        _log_paper_working_set_loaded(
-                            iteration=iteration,
-                            loaded_blocks=list(gaussians.gpu_working_set_manager.loaded_blocks),
-                            paper_block_sets=paper_block_sets,
-                            retention_stats=retention_stats,
-                            load_source=load_source,
-                            log_file=log_file,
-                        )
                     _log_paper_resident_camera_coverage(
                         iteration=iteration,
                         current_camera_blocks=current_camera_blocks,
@@ -1817,7 +1721,7 @@ def clm_offload_train_one_batch(
     # This enables true pipeline parallelism:
     # - GPU Compute Stream: Forward/Backward on current batch
     # - GPU Prefetch Stream: Load next batch's data in background
-    if storage_adapter is not None and training_schedule is not None and (use_fast_ram_ssd_path or is_paper_ssd_mode):
+    if storage_adapter is not None and training_schedule is not None and use_fast_ram_ssd_path:
         torch.cuda.nvtx.range_push("N+1 Prefetch: Start async load")
 
         try:
@@ -1851,57 +1755,8 @@ def clm_offload_train_one_batch(
                         log_file.write(f"[N+1 PREFETCH] Started async prefetch for iter {iteration + bsz}\n")
                         log_file.write(f"  Next cameras: {next_camera_ids[:3]}...\n")
                         log_file.write(f"  Next blocks: {len(next_visible_blocks)} blocks\n")
-            elif is_paper_ssd_mode and paper_block_sets is not None:
-                next_camera_ids = paper_block_sets['next_camera_ids']
-                next_active_blocks = paper_block_sets['next_blocks']
-                next_resident_blocks = paper_block_sets['next_resident_blocks']
-                stream_in_blocks = paper_block_sets['stream_in_blocks']
-
-                if len(next_resident_blocks) > 0:
-                    double_buffer = get_double_buffer_gpu(
-                        num_total=total_n_gaussians,
-                        block_size=args.gaussian_block_size,
-                        device='cuda'
-                    )
-                    active_block_reader = getattr(gaussians, '_block_reader', None)
-                    if active_block_reader is not None:
-                        future_submitted_late = int(active_block_reader.hint_future(stream_in_blocks) or 0)
-                        future_submitted = int(paper_delta_future_submitted_early) + future_submitted_late
-                        next_blocks_ram = None
-                    else:
-                        future_submitted_late = 0
-                        future_submitted = 0
-                        next_blocks_ram = storage_adapter.cache.prefetch(next_resident_blocks)
-                    double_buffer.start_prefetch(
-                        iteration=iteration + bsz,
-                        visible_block_ids=next_resident_blocks,
-                        filters_global=[],
-                        ram_cache={},
-                        block_cache=next_blocks_ram if active_block_reader is None else None,
-                        resident_block_ids=paper_block_sets['keep_resident_blocks'],
-                        evicted_block_ids=paper_block_sets['evict_blocks'],
-                        allow_resident_copy=True,
-                        block_reader=active_block_reader,
-                    )
-                    if should_log_paper_sets:
-                        _log_delta_stream_prefetch(
-                            iteration=iteration,
-                            paper_block_sets=paper_block_sets,
-                            future_submitted=future_submitted,
-                            future_submitted_late=future_submitted_late,
-                            storage_adapter=storage_adapter,
-                            log_file=log_file,
-                        )
-                        _log_paper_warm_layer_metrics(storage_adapter, iteration, 'prefetch', log_file=log_file)
         except Exception as e:
-            if is_paper_ssd_mode:
-                _log_ab_buffer_prefetch_failure(
-                    iteration=iteration,
-                    error=e,
-                    log_file=log_file,
-                )
-            else:
-                log_file.write(f"[N+1 PREFETCH] Warning: Prefetch failed: {e}\n")
+            log_file.write(f"[N+1 PREFETCH] Warning: Prefetch failed: {e}\n")
 
         torch.cuda.nvtx.range_pop()
 
@@ -1915,7 +1770,8 @@ def clm_offload_train_one_batch(
     else:
         gaussians.signal_tensor_pinned.zero_()
     signal_tensor_pinned = gaussians.signal_tensor_pinned
-    torch.cuda.synchronize()
+    if not is_paper_ssd_mode:
+        torch.cuda.synchronize()
 
     microbatch_idx = 0
 
@@ -2844,6 +2700,7 @@ def clm_offload_train_one_batch(
     _ts('stage5_optim_start')
 
     optimizer_updated_global_indices = None
+    optimizer_updated_block_ids = None
 
     assert microbatch_idx == bsz, f"microbatch_idx should be equal to bsz. Got {microbatch_idx} vs {bsz}"
 
@@ -2864,7 +2721,7 @@ def clm_offload_train_one_batch(
                 "Paper SSD release path only supports GPUResidentAdam. "
                 "Set --paper_optimizer_backend gpu_resident."
             )
-        _run_gpu_resident_adam_step(
+        optimizer_step_stats = _run_gpu_resident_adam_step(
             gaussians=gaussians,
             args=args,
             iteration=iteration,
@@ -2877,6 +2734,7 @@ def clm_offload_train_one_batch(
             log_prefix="[PAPER SSD MODE]",
             log_file=log_file,
         )
+        optimizer_updated_block_ids = optimizer_step_stats.get("updated_block_ids")
     else:
             # ================================================================
             # Non-SSD GPU-resident Adam optimization.
@@ -2995,17 +2853,33 @@ def clm_offload_train_one_batch(
             torch.cuda.nvtx.range_push("SSD: writeback updated blocks")
 
             if is_paper_ssd_mode:
-                updated_block_ids = _collect_paper_updated_block_ids(
-                    iteration=iteration,
-                    optimizer_updated_global_indices=optimizer_updated_global_indices,
-                    filters=filters,
+                with torch.cuda.nvtx.range("Tide writeback: updated block selection"):
+                    updated_block_ids = _collect_paper_updated_block_ids(
+                        iteration=iteration,
+                        optimizer_updated_block_ids=optimizer_updated_block_ids,
+                        optimizer_updated_global_indices=optimizer_updated_global_indices,
+                        filters=filters,
+                        block_size=args.gaussian_block_size,
+                        total_n_gaussians=total_n_gaussians,
+                        collect_from_indices_fn=_collect_updated_block_ids_from_indices,
+                        collect_from_filters_fn=_collect_updated_block_ids,
+                        should_log=should_log_paper_sets,
+                        log_file=log_file,
+                    )
+                double_buffer = get_double_buffer_gpu(
+                    num_total=total_n_gaussians,
                     block_size=args.gaussian_block_size,
-                    total_n_gaussians=total_n_gaussians,
-                    collect_from_indices_fn=_collect_updated_block_ids_from_indices,
-                    collect_from_filters_fn=_collect_updated_block_ids,
-                    should_log=should_log_paper_sets,
-                    log_file=log_file,
+                    device='cuda',
                 )
+                with torch.cuda.nvtx.range("Tide writeback: mark dirty blocks"):
+                    double_buffer.mark_dirty_blocks(updated_block_ids)
+
+                with torch.cuda.nvtx.range("Tide writeback: stage block bounds"):
+                    pending_bounds = gaussians.gpu_working_set_manager.stage_block_bounds(
+                        updated_block_ids
+                    )
+                    if pending_bounds is not None:
+                        storage_adapter.submit_bounds_refresh(pending_bounds)
             else:
                 updated_block_ids = _collect_updated_block_ids(
                     filters,
@@ -3020,33 +2894,100 @@ def clm_offload_train_one_batch(
                              gaussians.optimizer.is_ssd_offload_mode
 
             if is_paper_ssd_mode:
-                keep_resident_blocks = list(paper_block_sets['keep_resident_blocks']) if paper_block_sets is not None else []
-                staged_writeback_blocks, refreshed_omega, candidate_blocks = _apply_paper_writeback_payload(
-                    storage_adapter=storage_adapter,
-                    args=args,
-                    payload_iteration=iteration,
-                    current_iteration=iteration,
-                    updated_block_ids=updated_block_ids,
-                    omega_blocks=keep_resident_blocks,
-                    total_n_gaussians=total_n_gaussians,
-                    original_xyz=original_xyz,
-                    original_scaling=original_scaling,
-                    original_rotation=original_rotation,
-                    original_opacity=original_opacity,
-                    original_features_dc=original_features_dc,
-                    original_features_rest=original_features_rest,
-                    gpu_working_set_manager=gaussians.gpu_working_set_manager,
-                    build_updated_blocks_dict_from_gpu_fn=_build_updated_blocks_dict_from_gpu,
-                    sync_updated_blocks_from_gpu_views_to_cpu_fn=_sync_updated_blocks_from_gpu_views_to_cpu,
-                    materialize_updated_blocks_from_cpu_views_fn=_materialize_updated_blocks_from_cpu_views,
-                    get_double_buffer_gpu_fn=get_double_buffer_gpu,
-                )
+                if paper_plan_future is None:
+                    raise RuntimeError("Tide resident plan was not submitted")
+                with torch.cuda.nvtx.range("Tide writeback: await resident plan"):
+                    paper_plan_result = paper_plan_future.result()
+                with torch.cuda.nvtx.range("Tide writeback: publish resident plan"):
+                    paper_block_sets = paper_plan_result["block_sets"]
+                    gaussians._paper_expected_resident_blocks = list(
+                        paper_block_sets['next_resident_blocks']
+                    )
+                    gaussians._paper_resident_recency_scores = dict(
+                        paper_block_sets.get('updated_recency_scores', {})
+                    )
+                    gaussians._paper_plan_bounds_generation = int(
+                        paper_plan_result["bounds_generation"]
+                    )
 
-                if refreshed_omega > 0:
-                    _log_delta_refresh(
+                if should_log_paper_sets:
+                    _log_paper_block_sets(
+                        log_file=log_file,
                         iteration=iteration,
-                        refreshed_omega=refreshed_omega,
-                        refresh_context='immediate writeback barrier',
+                        current_camera_ids=current_camera_ids,
+                        block_sets=paper_block_sets,
+                    )
+                    stream_in_for_next = list(
+                        paper_block_sets.get('stream_in_blocks', [])
+                    )
+                    _log_early_delta_hint(
+                        storage_adapter=storage_adapter,
+                        iteration=iteration,
+                        submitted=int(paper_plan_result["future_submitted"]),
+                        requested=len(stream_in_for_next),
+                        log_file=log_file,
+                    )
+                    _log_delta_stream_prefetch(
+                        iteration=iteration,
+                        paper_block_sets=paper_block_sets,
+                        future_submitted=int(paper_plan_result["future_submitted"]),
+                        future_submitted_late=0,
+                        storage_adapter=storage_adapter,
+                        log_file=log_file,
+                    )
+                    _log_paper_working_set_loaded(
+                        iteration=iteration,
+                        loaded_blocks=list(gaussians.gpu_working_set_manager.loaded_blocks),
+                        paper_block_sets=paper_block_sets,
+                        retention_stats=retention_stats,
+                        load_source=paper_ab_buffer_source or retention_stats.get('source', 'sync_ram_to_gpu'),
+                        log_file=log_file,
+                    )
+                    _log_paper_warm_layer_metrics(
+                        storage_adapter,
+                        iteration,
+                        'prefetch',
+                        log_file=log_file,
+                    )
+
+                keep_resident_blocks = list(paper_block_sets['keep_resident_blocks']) if paper_block_sets is not None else []
+                evicted_blocks = list(paper_block_sets['evict_blocks']) if paper_block_sets is not None else []
+                with torch.cuda.nvtx.range("Tide writeback: dirty eviction selection"):
+                    writeback_block_ids = double_buffer.dirty_blocks_for_eviction(evicted_blocks)
+                with torch.cuda.nvtx.range("Tide writeback: stage eviction payload"):
+                    staged_writeback_blocks, ready_omega, copied_omega, candidate_blocks = _apply_paper_writeback_payload(
+                        storage_adapter=storage_adapter,
+                        args=args,
+                        payload_iteration=iteration,
+                        current_iteration=iteration,
+                        updated_block_ids=writeback_block_ids,
+                        omega_blocks=keep_resident_blocks,
+                        total_n_gaussians=total_n_gaussians,
+                        original_xyz=original_xyz,
+                        original_scaling=original_scaling,
+                        original_rotation=original_rotation,
+                        original_opacity=original_opacity,
+                        original_features_dc=original_features_dc,
+                        original_features_rest=original_features_rest,
+                        gpu_working_set_manager=gaussians.gpu_working_set_manager,
+                        build_updated_blocks_dict_from_gpu_fn=_build_updated_blocks_dict_from_gpu,
+                        sync_updated_blocks_from_gpu_views_to_cpu_fn=_sync_updated_blocks_from_gpu_views_to_cpu,
+                        materialize_updated_blocks_from_cpu_views_fn=_materialize_updated_blocks_from_cpu_views,
+                        get_double_buffer_gpu_fn=get_double_buffer_gpu,
+                    )
+                if staged_writeback_blocks != len(writeback_block_ids):
+                    raise RuntimeError(
+                        "Dirty eviction writeback was incomplete: "
+                        f"expected={len(writeback_block_ids)} staged={staged_writeback_blocks}"
+                    )
+                double_buffer.mark_blocks_written_back(writeback_block_ids)
+
+                if ready_omega > 0:
+                    _log_delta_handoff(
+                        iteration=iteration,
+                        ready_omega=ready_omega,
+                        copied_omega=copied_omega,
+                        context='immediate writeback barrier',
                         log_file=log_file,
                     )
 
@@ -3063,7 +3004,8 @@ def clm_offload_train_one_batch(
                         optimizer_deferred_mode=paper_optimizer_deferred_mode,
                         candidate_blocks=candidate_blocks,
                         staged_writeback_blocks=staged_writeback_blocks,
-                        refreshed_omega=refreshed_omega,
+                        ready_omega=ready_omega,
+                        copied_omega=copied_omega,
                         log_file=log_file,
                     )
             else:
@@ -3164,70 +3106,74 @@ def clm_offload_train_one_batch(
 
             torch.cuda.nvtx.range_pop()
 
-    if defer_gpu_working_set_clear and hasattr(gaussians, 'gpu_working_set_manager'):
-        gaussians.gpu_working_set_manager.clear()
-        if is_paper_ssd_mode:
-            _log_paper_working_set_cleared(log_file=log_file)
+    with torch.cuda.nvtx.range("Tide engine tail: retain working set"):
+        if defer_gpu_working_set_clear and hasattr(gaussians, 'gpu_working_set_manager'):
+            gaussians.gpu_working_set_manager.prepare_for_retention()
+            if is_paper_ssd_mode:
+                _log_paper_working_set_retained(log_file=log_file)
 
     _ts('stage5_writeback_done')
     # ------------------------------------------------------------------------
     # 5.3: Final synchronization and return
     # ------------------------------------------------------------------------
-    torch.cuda.synchronize()
+    if not is_paper_ssd_mode:
+        torch.cuda.synchronize()
     _ts('stage5_sync_done')
     
     # ============================================================================
     # [MEMORY CLEANUP] Periodic cleanup to prevent memory accumulation
     # ============================================================================
     # Clear intermediate variables to help garbage collection
-    if iteration % 100 == 0:
-        # Force Python garbage collection periodically
-        gc.collect()
-        
-        # Clear CUDA cache if GPU memory pressure is high
-        if torch.cuda.is_available():
-            gpu_mem_percent = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() if torch.cuda.max_memory_allocated() > 0 else 0
-            if gpu_mem_percent > 0.9:
-                torch.cuda.empty_cache()
+    with torch.cuda.nvtx.range("Tide engine tail: memory maintenance"):
+        if iteration % 100 == 0:
+            # Force Python garbage collection periodically
+            gc.collect()
+
+            # Clear CUDA cache if GPU memory pressure is high
+            if torch.cuda.is_available():
+                gpu_mem_percent = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() if torch.cuda.max_memory_allocated() > 0 else 0
+                if gpu_mem_percent > 0.9:
+                    torch.cuda.empty_cache()
     
     # ============================================================================
     # [STATS] Log double buffer and prefetch statistics periodically
     # ============================================================================
-    if iteration % 1000 == 0:
-        global _double_buffer_gpu
-        _log_double_buffer_stats(
-            iteration=iteration,
-            double_buffer=_double_buffer_gpu,
-            log_file=log_file,
-        )
-    
-    # [PERF PROFILE] Print stage timings
-    _ts('iter_end')
-    if _perf_log:
-        if is_paper_ssd_mode:
-            _log_paper_perf_profile(
+    with torch.cuda.nvtx.range("Tide engine tail: metrics and logging"):
+        if iteration % 1000 == 0:
+            global _double_buffer_gpu
+            _log_double_buffer_stats(
                 iteration=iteration,
-                perf_times=_perf_t,
+                double_buffer=_double_buffer_gpu,
                 log_file=log_file,
-                storage_adapter=storage_adapter,
             )
-        else:
-            def _dt(a, b):
-                return (_perf_t.get(b, _perf_t['iter_start']) - _perf_t.get(a, _perf_t['iter_start'])) * 1000
-            perf_message = (
-                f"[PERF] Iter {iteration}: "
-                f"setup={_dt('iter_start','stage1_setup_done'):.0f}ms  "
-                f"ssd_cull+load={_dt('stage1_setup_done','stage1_5_ssd_done'):.0f}ms  "
-                f"gauss_cull={_dt('stage1_5_ssd_done','stage2_3_culling_done'):.0f}ms  "
-                f"train={_dt('stage2_3_culling_done','stage4_train_done'):.0f}ms  "
-                f"optim={_dt('stage5_optim_start','stage5_optim_done'):.0f}ms  "
-                f"writeback={_dt('stage5_optim_done','stage5_writeback_done'):.0f}ms  "
-                f"cuda_sync={_dt('stage5_writeback_done','stage5_sync_done'):.0f}ms  "
-                f"cleanup={_dt('stage5_sync_done','iter_end'):.0f}ms  "
-                f"TOTAL={_dt('iter_start','iter_end'):.0f}ms\n"
-            )
-            log_file.write(perf_message)
-        log_file.flush()
+
+        # [PERF PROFILE] Print stage timings
+        _ts('iter_end')
+        if _perf_log:
+            if is_paper_ssd_mode:
+                _log_paper_perf_profile(
+                    iteration=iteration,
+                    perf_times=_perf_t,
+                    log_file=log_file,
+                    storage_adapter=storage_adapter,
+                )
+            else:
+                def _dt(a, b):
+                    return (_perf_t.get(b, _perf_t['iter_start']) - _perf_t.get(a, _perf_t['iter_start'])) * 1000
+                perf_message = (
+                    f"[PERF] Iter {iteration}: "
+                    f"setup={_dt('iter_start','stage1_setup_done'):.0f}ms  "
+                    f"ssd_cull+load={_dt('stage1_setup_done','stage1_5_ssd_done'):.0f}ms  "
+                    f"gauss_cull={_dt('stage1_5_ssd_done','stage2_3_culling_done'):.0f}ms  "
+                    f"train={_dt('stage2_3_culling_done','stage4_train_done'):.0f}ms  "
+                    f"optim={_dt('stage5_optim_start','stage5_optim_done'):.0f}ms  "
+                    f"writeback={_dt('stage5_optim_done','stage5_writeback_done'):.0f}ms  "
+                    f"cuda_sync={_dt('stage5_writeback_done','stage5_sync_done'):.0f}ms  "
+                    f"cleanup={_dt('stage5_sync_done','iter_end'):.0f}ms  "
+                    f"TOTAL={_dt('iter_start','iter_end'):.0f}ms\n"
+                )
+                log_file.write(perf_message)
+            log_file.flush()
 
     return losses, ordered_cams, sparsity
 

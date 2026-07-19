@@ -9,6 +9,8 @@ an explicit debug/fallback path.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -40,6 +42,26 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return value
+
+
+def _atomic_json_dump(payload: Dict[str, Any], path: Path) -> None:
+    temp = path.with_name(f".{path.name}.tmp")
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(_jsonable(payload), handle, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+def _atomic_torch_save(payload: Dict[str, Any], path: Path) -> None:
+    temp = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, temp)
+    descriptor = os.open(temp, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temp, path)
 
 
 def _resolve_path(path_value: str, checkpoint_dir: Path) -> str:
@@ -150,6 +172,12 @@ def _wait_for_pending_writeback(cache, log_file=None) -> None:
         _log("[PURE SSD CHECKPOINT] WARNING: timed out waiting for flushing_buffer", log_file)
 
 
+def _flush_gpu_resident_dirty(storage_adapter) -> None:
+    flush_resident = getattr(storage_adapter, "flush_resident_dirty", None)
+    if callable(flush_resident):
+        flush_resident()
+
+
 def _manifest_base(storage_adapter, gaussians) -> Dict[str, Any]:
     manifest = dict(getattr(storage_adapter, "streaming_init_manifest", None) or {})
     manifest.setdefault("source_ply", getattr(gaussians, "_streaming_init_ply_path", ""))
@@ -203,6 +231,7 @@ def write_pure_ssd_snapshot_checkpoint(
         f"[PURE SSD CHECKPOINT] Flushing dirty blocks before snapshot iter={iteration}",
         log_file,
     )
+    _flush_gpu_resident_dirty(storage_adapter)
     _wait_for_pending_writeback(getattr(storage_adapter, "cache", None), log_file=log_file)
 
     _log(
@@ -282,7 +311,7 @@ def write_pure_ssd_snapshot_checkpoint(
         },
     }
 
-    torch.save(
+    _atomic_torch_save(
         {
             "next_iteration": int(next_iteration),
             "active_sh_degree": int(getattr(gaussians, "active_sh_degree", 0)),
@@ -291,9 +320,7 @@ def write_pure_ssd_snapshot_checkpoint(
         },
         training_state_file,
     )
-
-    with open(manifest_file, "w", encoding="utf-8") as f:
-        json.dump(_jsonable(manifest), f, indent=2, sort_keys=True)
+    _atomic_json_dump(manifest, manifest_file)
 
     _log(
         f"[PURE SSD CHECKPOINT] Snapshot complete: {actual_size / (1024 ** 3):.2f}GB "
@@ -347,12 +374,18 @@ def write_pure_ssd_incremental_checkpoint(
         f"[PURE SSD CHECKPOINT] Flushing dirty blocks before incremental iter={iteration}",
         log_file,
     )
+    _flush_gpu_resident_dirty(storage_adapter)
     _wait_for_pending_writeback(getattr(storage_adapter, "cache", None), log_file=log_file)
+    compacted_before_checkpoint = storage.maybe_compact(min_patches=2, force=True)
+
+    patch_file_mode = str(
+        getattr(args, "pure_ssd_checkpoint_patch_mode", "hardlink")
+    ).lower()
 
     index_manifest = storage.export_index_manifest(
         manifest_path=storage_index_file,
         patches_dir=patches_dir,
-        copy_patch_files=True,
+        patch_file_mode=patch_file_mode,
     )
 
     base_file = Path(index_manifest["files"]["0"]["path"])
@@ -369,8 +402,12 @@ def write_pure_ssd_incremental_checkpoint(
     block_bounds = np.asarray(block_bounds, dtype=np.float32)
     np.save(block_bounds_file, block_bounds)
 
+    patch_files = int(index_manifest.get("patch_files", 0))
+    patch_bytes = int(index_manifest.get("patch_bytes", 0))
     copied_patch_files = int(index_manifest.get("copied_patch_files", 0))
     copied_patch_bytes = int(index_manifest.get("copied_patch_bytes", 0))
+    linked_patch_files = int(index_manifest.get("linked_patch_files", 0))
+    linked_patch_bytes = int(index_manifest.get("linked_patch_bytes", 0))
     base_manifest = _manifest_base(storage_adapter, gaussians)
     scene_min = getattr(storage_adapter, "scene_min", base_manifest.get("scene_min", [0.0, 0.0, 0.0]))
     scene_max = getattr(storage_adapter, "scene_max", base_manifest.get("scene_max", [0.0, 0.0, 0.0]))
@@ -392,8 +429,14 @@ def write_pure_ssd_incremental_checkpoint(
         "delta_dir": str(delta_dir.resolve()),
         "storage_index": str(storage_index_file.resolve()),
         "patches_dir": str(patches_dir.resolve()),
+        "patch_file_mode": patch_file_mode,
+        "patch_files": patch_files,
+        "patch_bytes": patch_bytes,
         "patch_files_copied": copied_patch_files,
         "patch_bytes_copied": copied_patch_bytes,
+        "patch_files_linked": linked_patch_files,
+        "patch_bytes_linked": linked_patch_bytes,
+        "compacted_before_checkpoint": bool(compacted_before_checkpoint),
         "training_state": str(training_state_file.resolve()),
         "scene_min": np.asarray(scene_min, dtype=np.float32).tolist(),
         "scene_max": np.asarray(scene_max, dtype=np.float32).tolist(),
@@ -404,10 +447,15 @@ def write_pure_ssd_incremental_checkpoint(
             "paper_block_reader_backend": getattr(args, "paper_block_reader_backend", None),
             "paper_resident_capacity_blocks": getattr(args, "paper_resident_capacity_blocks", None),
             "pure_ssd_checkpoint_mode": getattr(args, "pure_ssd_checkpoint_mode", None),
+            "pure_ssd_checkpoint_patch_mode": patch_file_mode,
+            "pure_ssd_checkpoint_keep_last": getattr(args, "pure_ssd_checkpoint_keep_last", None),
+            "tide_storage_max_patch_files": getattr(args, "tide_storage_max_patch_files", None),
+            "tide_storage_max_patch_gb": getattr(args, "tide_storage_max_patch_gb", None),
+            "tide_storage_min_free_gb": getattr(args, "tide_storage_min_free_gb", None),
         },
     }
 
-    torch.save(
+    _atomic_torch_save(
         {
             "next_iteration": int(next_iteration),
             "active_sh_degree": int(getattr(gaussians, "active_sh_degree", 0)),
@@ -417,13 +465,34 @@ def write_pure_ssd_incremental_checkpoint(
         },
         training_state_file,
     )
-
-    with open(manifest_file, "w", encoding="utf-8") as f:
-        json.dump(_jsonable(manifest), f, indent=2, sort_keys=True)
+    _atomic_json_dump(manifest, manifest_file)
 
     _log(
-        f"[PURE SSD CHECKPOINT] Incremental complete: patches={copied_patch_files} "
-        f"size={copied_patch_bytes / (1024 ** 3):.2f}GB manifest={manifest_file}",
+        f"[PURE SSD CHECKPOINT] Incremental complete: patches={patch_files} "
+        f"size={patch_bytes / (1024 ** 3):.2f}GB "
+        f"linked={linked_patch_files} copied={copied_patch_files} "
+        f"physical_copy={copied_patch_bytes / (1024 ** 3):.2f}GB "
+        f"manifest={manifest_file}",
         log_file,
     )
     return manifest
+
+
+def prune_checkpoint_history(model_path: str | Path, keep_last: int, log_file=None) -> list[Path]:
+    """Delete older numeric checkpoint directories after a new checkpoint succeeds."""
+    keep_last = int(keep_last)
+    if keep_last == -1:
+        return []
+    if keep_last <= 0:
+        raise ValueError("keep_last must be -1 or a positive integer")
+
+    checkpoint_root = Path(model_path) / "checkpoints"
+    checkpoints = sorted(
+        (path for path in checkpoint_root.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=lambda path: int(path.name),
+    ) if checkpoint_root.is_dir() else []
+    removed = checkpoints[:-keep_last]
+    for path in removed:
+        shutil.rmtree(path)
+        _log(f"[PURE SSD CHECKPOINT] Pruned checkpoint {path}", log_file)
+    return removed

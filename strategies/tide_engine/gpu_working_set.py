@@ -18,7 +18,170 @@ Key features:
 
 import torch
 import numpy as np
+import threading
 from typing import Dict, List, Optional, Tuple
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover
+    triton = None
+    tl = None
+
+
+if triton is not None:
+
+    @triton.jit
+    def _pack_resident_rows_kernel(
+        source_xyz,
+        source_scaling,
+        source_rotation,
+        source_opacity,
+        source_features_dc,
+        source_features_rest,
+        source_starts,
+        row_counts,
+        output_starts,
+        output,
+        COPY_BLOCK_SIZE: tl.constexpr,
+    ):
+        block_position = tl.program_id(0)
+        row_count = tl.load(row_counts + block_position)
+        offsets = tl.program_id(1) * COPY_BLOCK_SIZE + tl.arange(0, COPY_BLOCK_SIZE)
+        mask = offsets < row_count * 59
+        row = offsets // 59
+        column = offsets - row * 59
+        source_row = tl.load(source_starts + block_position) + row
+        output_offset = (tl.load(output_starts + block_position) + row) * 59 + column
+
+        value = tl.zeros((COPY_BLOCK_SIZE,), dtype=tl.float32)
+        xyz_mask = mask & (column < 3)
+        scaling_mask = mask & (column >= 3) & (column < 6)
+        rotation_mask = mask & (column >= 6) & (column < 10)
+        opacity_mask = mask & (column == 10)
+        dc_mask = mask & (column >= 11) & (column < 14)
+        rest_mask = mask & (column >= 14)
+        value += tl.load(source_xyz + source_row * 3 + column, mask=xyz_mask, other=0.0)
+        value += tl.load(
+            source_scaling + source_row * 3 + (column - 3),
+            mask=scaling_mask,
+            other=0.0,
+        )
+        value += tl.load(
+            source_rotation + source_row * 4 + (column - 6),
+            mask=rotation_mask,
+            other=0.0,
+        )
+        value += tl.load(source_opacity + source_row, mask=opacity_mask, other=0.0)
+        value += tl.load(
+            source_features_dc + source_row * 3 + (column - 11),
+            mask=dc_mask,
+            other=0.0,
+        )
+        value += tl.load(
+            source_features_rest + source_row * 45 + (column - 14),
+            mask=rest_mask,
+            other=0.0,
+        )
+        tl.store(output + output_offset, value, mask=mask)
+
+    @triton.jit
+    def _resident_block_bounds_kernel(
+        xyz,
+        block_starts,
+        block_lengths,
+        output,
+        BLOCK_ROWS: tl.constexpr,
+    ):
+        block_position = tl.program_id(0)
+        row_offsets = tl.arange(0, BLOCK_ROWS)
+        start = tl.load(block_starts + block_position)
+        length = tl.load(block_lengths + block_position)
+        mask = row_offsets < length
+        rows = start + row_offsets
+
+        for axis in tl.static_range(0, 3):
+            values = tl.load(
+                xyz + rows * 3 + axis,
+                mask=mask,
+                other=1.0e20,
+            )
+            tl.store(output + block_position * 6 + axis, tl.min(values, axis=0))
+            values = tl.load(
+                xyz + rows * 3 + axis,
+                mask=mask,
+                other=-1.0e20,
+            )
+            tl.store(output + block_position * 6 + 3 + axis, tl.max(values, axis=0))
+
+
+class PendingBlockBounds:
+    """Compact per-block bounds awaiting one asynchronous D2H copy."""
+
+    def __init__(self, block_ids, cpu_bounds, ready_event, gpu_bounds=None):
+        self.block_ids = list(block_ids)
+        self.cpu_bounds = cpu_bounds
+        self.ready_event = ready_event
+        self.gpu_bounds = gpu_bounds
+
+    def wait(self) -> Tuple[List[int], torch.Tensor]:
+        self.ready_event.synchronize()
+        return self.block_ids, self.cpu_bounds
+
+
+class PendingBlockWriteback:
+    """One batched GPU-to-CPU writeback awaiting a single CUDA event."""
+
+    COMPONENT_ORDER = (
+        'xyz',
+        'scaling',
+        'rotation',
+        'opacity',
+        'features_dc',
+        'features_rest',
+    )
+
+    def __init__(
+        self,
+        plans,
+        packed_cpu,
+        ready_event,
+        release_event=None,
+        gpu_refs=None,
+    ):
+        self.plans = plans
+        self.packed_cpu = packed_cpu
+        self.ready_event = ready_event
+        self.release_event = release_event
+        self.gpu_refs = list(gpu_refs or [])
+        self._result = None
+        self._wait_lock = threading.Lock()
+
+    @property
+    def block_ids(self) -> List[int]:
+        return [int(block_id) for block_id, _ in self.plans]
+
+    def wait_gpu(self) -> None:
+        self.ready_event.synchronize()
+
+    def wait(self) -> Dict[int, torch.Tensor]:
+        if self._result is not None:
+            return self._result
+        with self._wait_lock:
+            if self._result is not None:
+                return self._result
+            self.wait_gpu()
+            result: Dict[int, torch.Tensor] = {}
+            offset = 0
+            for block_id, row_count in self.plans:
+                result[block_id] = self.packed_cpu[offset:offset + row_count]
+                offset += row_count
+            self._result = result
+        return result
+
+    def release(self) -> None:
+        if self.release_event is not None:
+            self.release_event.set()
 
 
 class GPUWorkingSet:
@@ -100,6 +263,24 @@ class GPUWorkingSet:
 
         # Compact block-start lookup: O(num_blocks) instead of O(N)
         self._block_starts: Optional[torch.Tensor] = None
+
+        self._writeback_stream = torch.cuda.Stream(device=self.device)
+        self._writeback_staging_slots: List[Optional[torch.Tensor]] = [None, None]
+        self._writeback_gpu_staging_slots: List[Optional[torch.Tensor]] = [None, None]
+        self._writeback_staging_capacities = [0, 0]
+        self._writeback_slot_available = [threading.Event(), threading.Event()]
+        for available in self._writeback_slot_available:
+            available.set()
+        self._next_writeback_slot = 0
+        self.writeback_stats = {
+            'batched_writebacks': 0,
+            'batched_writeback_blocks': 0,
+            'batched_writeback_rows': 0,
+            'async_d2h_calls': 0,
+            'pinned_staging_bytes': 0,
+            'pinned_staging': False,
+            'bounds_updates': 0,
+        }
         
         self._log(f"[GPUWorkingSet] Initialized for {num_total_gaussians:,} Gaussians")
         self._log(f"[GPUWorkingSet] Block size: {block_size:,}, Total blocks: {self.num_blocks}")
@@ -667,8 +848,219 @@ class GPUWorkingSet:
             stats["memory_mb"] = memory_mb
         
         return stats
+
+    def _acquire_writeback_staging(
+        self,
+        required_rows: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, threading.Event]:
+        slot_idx = self._next_writeback_slot
+        self._next_writeback_slot = (
+            slot_idx + 1
+        ) % len(self._writeback_staging_slots)
+        available = self._writeback_slot_available[slot_idx]
+        available.wait()
+        available.clear()
+
+        staging = self._writeback_staging_slots[slot_idx]
+        gpu_staging = self._writeback_gpu_staging_slots[slot_idx]
+        if (
+            staging is not None
+            and gpu_staging is not None
+            and required_rows <= self._writeback_staging_capacities[slot_idx]
+        ):
+            return staging, gpu_staging, available
+
+        try:
+            staging = torch.empty(
+                (required_rows, 59), dtype=torch.float32, pin_memory=True
+            )
+        except RuntimeError:
+            staging = torch.empty((required_rows, 59), dtype=torch.float32)
+        gpu_staging = torch.empty(
+            (required_rows, 59), dtype=torch.float32, device=self.device
+        )
+        self._writeback_staging_slots[slot_idx] = staging
+        self._writeback_gpu_staging_slots[slot_idx] = gpu_staging
+        self._writeback_staging_capacities[slot_idx] = required_rows
+        self.writeback_stats['pinned_staging_bytes'] = sum(
+            slot.numel() * slot.element_size()
+            for slot in self._writeback_staging_slots if slot is not None
+        )
+        self.writeback_stats['pinned_staging'] = all(
+            slot.is_pinned()
+            for slot in self._writeback_staging_slots if slot is not None
+        )
+        return staging, gpu_staging, available
+
+    def stage_updated_blocks(
+        self,
+        updated_block_ids: List[int],
+    ) -> Optional[PendingBlockWriteback]:
+        """Pack updated blocks and enqueue one batched D2H copy."""
+        sources = {
+            'xyz': self.gpu_xyz,
+            'scaling': self.gpu_scaling,
+            'rotation': self.gpu_rotation,
+            'opacity': self.gpu_opacity,
+            'features_dc': self.gpu_features_dc,
+            'features_rest': self.gpu_features_rest,
+        }
+        if not updated_block_ids or any(tensor is None for tensor in sources.values()):
+            return None
+
+        plans = []
+        local_slices = []
+        for block_id in sorted(set(int(block_id) for block_id in updated_block_ids)):
+            local_slice = self.block_to_gpu_slice.get(block_id)
+            if local_slice is None:
+                continue
+            global_start = block_id * self.block_size
+            expected_rows = min(self.block_size, self.num_total - global_start)
+            local_rows = int(local_slice.stop - local_slice.start)
+            row_count = min(expected_rows, local_rows)
+            if row_count <= 0:
+                continue
+            plans.append((block_id, row_count))
+            local_slices.append(slice(local_slice.start, local_slice.start + row_count))
+        if not plans:
+            return None
+
+        total_rows = sum(row_count for _, row_count in plans)
+        staging, gpu_staging, release_event = self._acquire_writeback_staging(total_rows)
+        pinned = bool(self.writeback_stats['pinned_staging'])
+        packed_cpu = staging[:total_rows]
+        packed_gpu = gpu_staging[:total_rows]
+        source_starts = torch.tensor(
+            [local_slice.start for local_slice in local_slices],
+            dtype=torch.long,
+            device=self.device,
+        )
+        row_counts = torch.tensor(
+            [row_count for _, row_count in plans],
+            dtype=torch.long,
+            device=self.device,
+        )
+        output_starts = torch.tensor(
+            np.cumsum([0] + [row_count for _, row_count in plans[:-1]]),
+            dtype=torch.long,
+            device=self.device,
+        )
+        ready_event = torch.cuda.Event()
+        current_stream = torch.cuda.current_stream(self.device)
+        with torch.cuda.stream(self._writeback_stream):
+            self._writeback_stream.wait_stream(current_stream)
+            if triton is not None:
+                grid = (len(plans), triton.cdiv(self.block_size * 59, 256))
+                _pack_resident_rows_kernel[grid](
+                    sources['xyz'],
+                    sources['scaling'],
+                    sources['rotation'],
+                    sources['opacity'],
+                    sources['features_dc'],
+                    sources['features_rest'],
+                    source_starts,
+                    row_counts,
+                    output_starts,
+                    packed_gpu,
+                    COPY_BLOCK_SIZE=256,
+                    num_warps=4,
+                )
+            else:  # pragma: no cover
+                offset = 0
+                for local_slice, (_, row_count) in zip(local_slices, plans):
+                    packed_gpu[offset:offset + row_count] = torch.cat(
+                        [source[local_slice] for source in sources.values()], dim=1
+                    )
+                    offset += row_count
+            packed_cpu.copy_(packed_gpu, non_blocking=pinned)
+            ready_event.record(self._writeback_stream)
+
+        self.writeback_stats['batched_writebacks'] += 1
+        self.writeback_stats['batched_writeback_blocks'] += len(plans)
+        self.writeback_stats['batched_writeback_rows'] += total_rows
+        self.writeback_stats['async_d2h_calls'] += 1
+        return PendingBlockWriteback(
+            plans,
+            packed_cpu,
+            ready_event,
+            release_event=release_event,
+            gpu_refs=[packed_gpu, source_starts, row_counts, output_starts],
+        )
+
+    def stage_block_bounds(
+        self,
+        block_ids: List[int],
+    ) -> Optional[PendingBlockBounds]:
+        if self.gpu_xyz is None or not block_ids:
+            return None
+
+        plans = []
+        for block_id in sorted(set(int(block_id) for block_id in block_ids)):
+            local_slice = self.block_to_gpu_slice.get(block_id)
+            if local_slice is None:
+                continue
+            global_start = block_id * self.block_size
+            expected_rows = min(self.block_size, self.num_total - global_start)
+            row_count = min(
+                expected_rows,
+                int(local_slice.stop - local_slice.start),
+            )
+            if row_count > 0:
+                plans.append((block_id, int(local_slice.start), row_count))
+        if not plans:
+            return None
+
+        block_ids_out = [block_id for block_id, _, _ in plans]
+        starts = torch.tensor(
+            [start for _, start, _ in plans],
+            dtype=torch.long,
+            device=self.device,
+        )
+        lengths = torch.tensor(
+            [row_count for _, _, row_count in plans],
+            dtype=torch.long,
+            device=self.device,
+        )
+        bounds_gpu = torch.empty(
+            (len(plans), 6), dtype=torch.float32, device=self.device
+        )
+        try:
+            bounds_cpu = torch.empty(
+                (len(plans), 6), dtype=torch.float32, pin_memory=True
+            )
+        except RuntimeError:
+            bounds_cpu = torch.empty((len(plans), 6), dtype=torch.float32)
+
+        ready_event = torch.cuda.Event()
+        current_stream = torch.cuda.current_stream(self.device)
+        with torch.cuda.stream(self._writeback_stream):
+            self._writeback_stream.wait_stream(current_stream)
+            if triton is not None:
+                _resident_block_bounds_kernel[(len(plans),)](
+                    self.gpu_xyz,
+                    starts,
+                    lengths,
+                    bounds_gpu,
+                    BLOCK_ROWS=self.block_size,
+                    num_warps=8,
+                )
+            else:  # pragma: no cover
+                for position, (_, start, row_count) in enumerate(plans):
+                    xyz = self.gpu_xyz[start:start + row_count]
+                    bounds_gpu[position, :3] = xyz.amin(dim=0)
+                    bounds_gpu[position, 3:] = xyz.amax(dim=0)
+            bounds_cpu.copy_(bounds_gpu, non_blocking=bounds_cpu.is_pinned())
+            ready_event.record(self._writeback_stream)
+
+        self.writeback_stats['bounds_updates'] += len(plans)
+        return PendingBlockBounds(
+            block_ids_out,
+            bounds_cpu,
+            ready_event,
+            gpu_bounds=bounds_gpu,
+        )
     
-    def clear(self):
+    def clear(self, release_cuda_cache: bool = True):
         """Clear GPU working set and release ALL memory.
         
         Note: During training iterations, prefer prepare_for_retention() which
@@ -687,7 +1079,7 @@ class GPUWorkingSet:
         self._block_starts = None
         
         # Force garbage collection
-        if torch.cuda.is_available():
+        if release_cuda_cache and torch.cuda.is_available():
             torch.cuda.empty_cache()
     
     def prepare_for_retention(self):
@@ -724,3 +1116,4 @@ class GPUWorkingSet:
     def __del__(self):
         """Cleanup on deletion."""
         self.clear()
+        self._writeback_staging = None
