@@ -15,6 +15,7 @@ pytorch-cuda = "12.4.*"
 cuda-toolkit = "12.4.*"
 cuda-nvcc = "==12.4.131"
 cuda-cccl = "==12.4.127"
+plotly = ">=6,<7"
 
 [activation.env]
 PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"

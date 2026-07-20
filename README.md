@@ -130,6 +130,127 @@ The exact folder names can differ as long as `transforms_train.json` and
 are decoded into raw files under `--decode-dataset-path`; put this cache on a
 large local or shared SSD.
 
+## Applying COLMAP BA Output
+
+COLMAP scenes are detected automatically when `--source_path` contains a
+`sparse` directory. COLMAP camera poses and intrinsics are consumed directly;
+there is no need to generate `transforms_train.json` or
+`transforms_test.json`.
+
+### Expected layout
+
+Keep the registered images and the BA model in the same scene directory:
+
+```text
+<colmap_scene>/
+  images/
+    frame_000001.jpg
+    frame_000002.jpg
+    ...
+  sparse/
+    0/
+      cameras.bin       # cameras.txt is also accepted
+      images.bin        # images.txt is also accepted
+      points3D.bin      # points3D.txt is also accepted
+```
+
+The loader reads camera files from `sparse/0` and images from `images` by
+default. Use `--images <directory-name>` when the image directory has another
+name. Image paths are reduced to their basename by the current loader, so
+image basenames must be unique; a flat image directory is the safest layout.
+
+### BA model stored in a separate result directory
+
+Some COLMAP pipelines store `cameras.bin`, `images.bin`, and `points3D.bin`
+directly in a result directory such as `bundle_adjusted_refined`, with RGB
+images in a sibling directory. Create a small adapter with symlinks instead of
+copying either source:
+
+```bash
+export COLMAP_BA_MODEL=/path/to/bundle_adjusted_refined
+export COLMAP_RGB=/path/to/rgb
+export COLMAP_SCENE=/path/to/tidegs_colmap_adapter
+
+mkdir -p "$COLMAP_SCENE/sparse"
+ln -s "$COLMAP_BA_MODEL" "$COLMAP_SCENE/sparse/0"
+ln -s "$COLMAP_RGB" "$COLMAP_SCENE/images"
+```
+
+`frames.bin` and `rigs.bin` may coexist in the model directory; the current
+static COLMAP reader uses `cameras.bin`, `images.bin`, and `points3D.bin`.
+
+### Camera model assumption
+
+The following instructions assume that the COLMAP images are already
+undistorted and that the BA model uses `PINHOLE` or `SIMPLE_PINHOLE` camera
+models. Distortion correction is outside this integration path.
+
+Do not mix images, camera parameters, and poses from different COLMAP models.
+The point cloud and all camera poses must remain in the same BA coordinate
+system.
+
+### Which point cloud to use
+
+BA normally supplies a sparse `points3D.bin`/`points3D.txt`. For this case,
+TideGS creates `sparse/0/points3D.ply` automatically on first load. For a
+large scene, or when using the Pure SSD path, it is better to pass that PLY
+explicitly with `--dense_ply_file`.
+
+BA itself does not create a billion-point cloud. If a denser initialization is
+needed, run COLMAP dense reconstruction in the undistorted workspace and use
+the resulting PLY, for example:
+
+```bash
+colmap patch_match_stereo \
+  --workspace_path "$COLMAP_SCENE" \
+  --workspace_format COLMAP \
+  --PatchMatchStereo.geom_consistency true
+
+colmap stereo_fusion \
+  --workspace_path "$COLMAP_SCENE" \
+  --workspace_format COLMAP \
+  --input_type geometric \
+  --output_path "$COLMAP_SCENE/dense/fused.ply"
+```
+
+Use `sparse/0/points3D.ply` for a BA-only sparse initialization or
+`dense/fused.ply` for the dense initialization. The latter must still be in
+the same coordinate frame as the registered cameras.
+
+### TideGS training command
+
+The TideGS training entry uses the streaming Pure SSD initializer, including
+for a normal COLMAP BA-sized sparse cloud. It also requires a batch size above
+one:
+
+```bash
+export TIDEGS_OUT=/path/to/tidegs_outputs/colmap_scene
+
+pixi run python train_tidegs.py \
+  --source_path "$COLMAP_SCENE" \
+  --model_path "$TIDEGS_OUT/model" \
+  --dense_ply_file "$COLMAP_SCENE/sparse/0/points3D.ply" \
+  --eval \
+  --llffhold 8 \
+  --decode_dataset_path "$TIDEGS_OUT/decoded" \
+  --pure_ssd_offload \
+  --pure_ssd_init_backend streaming \
+  --debug_fast_init_scales \
+  --ssd_cache_dir "$TIDEGS_OUT/ssd_cache" \
+  --paper_resident_capacity_blocks 2048 \
+  --iterations 30000 \
+  --bsz 2
+```
+
+For a large dense PLY, keep the SSD cache and decoded-image cache on fast
+storage. Repeated runs should reuse a generated `streaming_init_manifest.json`
+with `--pure_ssd_prebuilt_manifest`. Replace the `--dense_ply_file` value
+above with `$COLMAP_SCENE/dense/fused.ply` in that case.
+
+With `--eval`, cameras are sorted by image name and every `llffhold`-th camera
+is held out for testing (the default is 8). Without `--eval`, all COLMAP
+cameras are used for training.
+
 ## Recommended Paths
 
 The release scripts do not hard-code local dataset paths. Set these variables
