@@ -53,6 +53,26 @@ The release experiments used Python 3.10 with `torch==2.4.0+cu124`,
 PyTorch stack for your CUDA/platform first, then install the remaining Python
 dependencies and project extensions:
 
+### Pixi (recommended)
+
+The repository includes a `pixi.toml` that pins the Python 3.10, PyTorch 2.4,
+and CUDA 12.4 environment. Create the environment with:
+
+```bash
+pixi install
+pixi run setup-extensions
+pixi run cuda-info
+```
+
+Run the test suite with `pixi run test`. The CUDA extensions must be rebuilt
+with `pixi run setup-extensions` if the environment or CUDA toolkit changes.
+The task uses the PyPI `fast-tsp` wheel because the checked-in copy does not
+contain its required `CMakeLists.txt`; it also supplies the complete Python
+wrappers from `gsplat==1.0.0` while retaining TideGS's locally built CUDA
+extensions.
+
+### pip (manual)
+
 ```bash
 git clone --recursive https://github.com/sponge-lab/TideGS.git
 cd TideGS

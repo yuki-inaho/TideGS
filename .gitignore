@@ -32,6 +32,7 @@ _test.py
 *.pyd
 .pytest_cache/
 .mypy_cache/
+.pixi/
 
 # Recursive packaging / extension build outputs
 **/build/
